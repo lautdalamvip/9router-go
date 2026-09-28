@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+### ✨ Auto Group combos by model family
+
+- A **Auto Group by Model** button on the combos page creates one fallback combo per model family from every **usable** chat model: any version, any provider. "claude-sonnet-4.6" (cc), "claude-sonnet-4.5" (claude) and a hand-added gateway sonnet all land in the combo **Auto: claude-sonnet**.
+- A model counts as usable when its provider has an **active** connection and the model is not in the user's `disabledModels` list. Embedding/image/audio models (declared `kind`, or "embedding" in the id) are skipped — they cannot serve a chat fallback chain.
+- Family normalization (`modelFamily`) drops generation numbers and lifecycle flags, keeping size/role words, so `gpt-5.4-mini`→`gpt-mini`, `gemini-3.1-flash-preview`→`gemini-flash`, `kimi-k2.7-code`→`kimi-code`, `minimax-m3`→`minimax`. OpenAI's o-series is deliberately preserved (`o1`, `o3-mini`) since the leading token is the model line, not a generation. Pure-version ids fall back to the original rather than merging into an empty family.
+- Combos are upserted under stable ids (`auto-family-<family>`) so regenerating refreshes rows instead of stacking duplicates. Families with under two usable models are skipped — a single-model combo has nothing to fall back to. Unlike the free-tier combo these stay fully editable (badge "Auto-generated", delete/reorder/edit all open).
+- Fixed a latent bug the new feature exposed: `isLlmCombo` rejected any `kind !== 'llm'`, so the auto free-tier combo was invisible on the combos page. It now accepts the `auto-*` kinds while still excluding the upstream `search-combo` media combos.
+
+### ✨ Provider model management: check latest, probe accessibility, prune unusable
+
+- `ProviderDetailView.svelte` gains a **Check Latest Models** button (reusing the existing `/api/providers/{id}/models` fetch, no new endpoint): it diffs the provider's live catalogue against the models already registered (built-in + custom) and lists only the new ones, each with an inline **Add** button. The button only renders for providers the backend can enumerate — live-catalogue providers (`cline`, `clinepass`, `qoder`, `qoder-cn`, `antigravity`, `gemini-cli`), the five `modelsListURL` providers, and OpenAI/Anthropic-compatible custom nodes.
+- A **Check All Models** button probes every model of the provider with the existing minimal-chat `api.testModel` path, at bounded concurrency (6 in flight) rather than firing one request per model at once. Each row shows ok/error, and on error gains a per-model **delete** button: custom models are removed via `deleteCustomModel`, built-in registry models (static, undeletable) are disabled instead. A summary line reports the failure count instead of spamming the single shared error banner.
+
+### ✨ Locked auto free-tier combo
+
+- A **Auto Free Tier** button on the combos page (re)builds the locked combo from the registry's free-tier models (`:free` / `/free` / `-free` suffixes) of providers the user actually has a connection for, so it never references unreachable providers.
+- Locked combos carry a badge and can be **reordered** (fallback order matters) but not edited or deleted — the delete button renders disabled, and `validateLockedReorder` rejects any update that changes the name, kind, or model *set* while permitting pure permutations.
+
 ### 🐛 Dashboard backup import always failed with `Invalid database payload`
 
 - `ProfileSettingsView.svelte` posted the chosen file as **`multipart/form-data`**, but `HandleImportDatabase` (like upstream `src/app/api/settings/database/route.js`) does `request.json()` on the body, so every import died at the decode with HTTP 400 and the user saw "Failed to import database: Import failed with status 400". The client now reads `file.text()`, `JSON.parse`s it, and PUTs the raw JSON body — verified against `E:\9router-backup-2026-09-25T15-07-00-715Z.json`.

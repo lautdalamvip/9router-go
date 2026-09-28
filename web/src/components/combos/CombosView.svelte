@@ -35,9 +35,10 @@
   }: Props = $props()
 
   // Upstream parity (combos page.js fetchData): webSearch/webFetch combos
-  // (notably search-combo) live under media-providers/web, not here.
+  // (notably search-combo) live under media-providers/web, not here. The
+  // auto-generated kinds are llm combos too and stay visible here.
   function isLlmCombo(c: Combo): boolean {
-    if (c.kind && c.kind !== 'llm') return false
+    if (c.kind && c.kind !== 'llm' && !c.kind.startsWith('auto-')) return false
     if (c.name === 'search-combo' || c.name.startsWith('search-combo-')) return false
     return true
   }
@@ -228,10 +229,79 @@
     }
   }
 
+  let isBuildingAutoFree = $state(false)
+
+  async function handleBuildAutoFree() {
+    isBuildingAutoFree = true
+    try {
+      const res = await api.buildAutoFreeCombo()
+      if (res.models.length === 0) {
+        alert('No free-tier models found among providers you have connections for.')
+      }
+      onRefresh()
+    } catch (e) {
+      alert(
+        'Failed to build auto free-tier combo: ' +
+          (e instanceof Error ? e.message : String(e))
+      )
+    } finally {
+      isBuildingAutoFree = false
+    }
+  }
+
+  let isBuildingAutoFamily = $state(false)
+
+  async function handleBuildAutoFamily() {
+    isBuildingAutoFamily = true
+    try {
+      const res = await api.buildAutoFamilyCombos()
+      if (res.count === 0) {
+        alert(
+          'No usable model families found. Add connections for providers with chat models, or enable disabled models.'
+        )
+      } else {
+        // A wide catalog yields dozens of families; show the head of the list
+        // rather than a wall of names.
+        const shown = res.created.slice(0, 8)
+        const extra = res.created.length - shown.length
+        alert(
+          `Grouped into ${res.count} combo(s): ${shown.join(', ')}` +
+            (extra > 0 ? ` (+${extra} more)` : '')
+        )
+      }
+      onRefresh()
+    } catch (e) {
+      alert(
+        'Failed to auto-group combos: ' + (e instanceof Error ? e.message : String(e))
+      )
+    } finally {
+      isBuildingAutoFamily = false
+    }
+  }
+
+  async function handleReorderCombo(combo: Combo, models: string[]) {
+    try {
+      await api.updateCombo(combo.id, {
+        name: combo.name,
+        kind: combo.kind ?? undefined,
+        models,
+      })
+      onRefresh()
+    } catch (e) {
+      console.error('Failed to reorder combo:', e)
+    }
+  }
+
 </script>
 
 <div class="flex min-w-0 flex-col gap-6 px-1 sm:px-0">
-  <CombosHeader onCreateClick={openCreateModal} />
+  <CombosHeader
+    onCreateClick={openCreateModal}
+    onAutoFreeClick={handleBuildAutoFree}
+    {isBuildingAutoFree}
+    onAutoFamilyClick={handleBuildAutoFamily}
+    {isBuildingAutoFamily}
+  />
 
   <!-- Combos List -->
   {#if llmCombos.length === 0}
@@ -260,6 +330,7 @@
           onCopy={copyName}
           onEdit={openEditModal}
           onDelete={(c) => (confirmState = { name: c.name, id: c.id })}
+          onReorder={handleReorderCombo}
         />
       {/each}
     </div>
