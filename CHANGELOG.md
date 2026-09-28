@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### 🐛 Dashboard backup import always failed with `Invalid database payload`
+
+- `ProfileSettingsView.svelte` posted the chosen file as **`multipart/form-data`**, but `HandleImportDatabase` (like upstream `src/app/api/settings/database/route.js`) does `request.json()` on the body, so every import died at the decode with HTTP 400 and the user saw "Failed to import database: Import failed with status 400". The client now reads `file.text()`, `JSON.parse`s it, and PUTs the raw JSON body — verified against `E:\9router-backup-2026-09-25T15-07-00-715Z.json`.
+- The destructive op also re-authenticates against the stored bcrypt hash, and the client never sent a password at all: once a dashboard password was set, import (and the plain anchor-click export, which is likewise an `x-9r-password`-gated route) returned 401. Upstream prompts in a modal first; the port now does the same — both buttons open a password modal, and the password travels in the `x-9r-password` header, matching upstream exactly.
+- Backup filename stamp regained full precision (`T15-07-00-715Z` instead of `T00-00-00-000Z`-style day-only), matching upstream's `toISOString().replace(/[.:]/g, '-')`.
+- Server side accepts the password from **either** the body field or the header, so the pre-existing body-embedded contract keeps working; `TestHandleImportDatabase_ClientContract` pins both the multipart rejection and the header auth. The upstream post-import `applyOutboundProxyEnv` has no Go equivalent yet (no `outboundProxyUrl` handling exists in this runtime), so it is noted in a comment rather than faked.
+
 ### 🐛 Claude decloak now recovers a tool name the map lost (`b65d2d0a`, #4342)
 
 - A cloaked tool name reached the client as an unresolvable `<tool>_ide` whenever `toolNameMap` missed it — the map is built per request, so a retry or a reconnect loses it. Both decloak paths now fall back to stripping the literal suffix: the non-streaming `DecloakClaudeResponseBody` and the streaming `ClaudeStreamDecloaker`. Decoy names are exempt, so they still reach the client unresolved and surface as "tool unavailable" rather than a silent no-op.
