@@ -7,6 +7,10 @@
     isBuildingAutoFree?: boolean
     onAutoFamilyClick?: () => void
     isBuildingAutoFamily?: boolean
+    selectedCount?: number
+    deletableCount?: number
+    onDeleteSelected?: () => void
+    onDeleteAll?: () => void
   }
 
   let {
@@ -15,6 +19,10 @@
     isBuildingAutoFree = false,
     onAutoFamilyClick,
     isBuildingAutoFamily = false,
+    selectedCount = 0,
+    deletableCount = 0,
+    onDeleteSelected,
+    onDeleteAll,
   }: Props = $props()
 </script>
 
@@ -41,27 +49,53 @@
     <Button icon="add" onclick={onCreateClick} class="w-full sm:w-auto whitespace-nowrap">
       Create Combo
     </Button>
-    {#if onAutoFamilyClick}
-      <Button
-        icon="hub"
-        onclick={onAutoFamilyClick}
-        disabled={isBuildingAutoFamily}
-        variant="outline"
-        class="w-full sm:w-auto whitespace-nowrap"
-      >
-        {isBuildingAutoFamily ? 'Grouping...' : 'Auto Group by Model'}
-      </Button>
-    {/if}
-    {#if onAutoFreeClick}
-      <Button
-        icon="auto_awesome"
-        onclick={onAutoFreeClick}
-        disabled={isBuildingAutoFree}
-        variant="secondary"
-        class="w-full sm:w-auto whitespace-nowrap"
-      >
-        {isBuildingAutoFree ? 'Building...' : 'Auto Free Tier'}
-      </Button>
-    {/if}
+    <div class="flex gap-2">
+      {#if onAutoFamilyClick}
+        <Button
+          icon="hub"
+          onclick={onAutoFamilyClick}
+          disabled={isBuildingAutoFamily}
+          variant="outline"
+          class="flex-1 whitespace-nowrap"
+        >
+          {isBuildingAutoFamily ? 'Grouping...' : 'Auto Group by Model'}
+        </Button>
+      {/if}
+      {#if onAutoFreeClick}
+        <Button
+          icon="auto_awesome"
+          onclick={onAutoFreeClick}
+          disabled={isBuildingAutoFree}
+          variant="secondary"
+          class="flex-1 whitespace-nowrap"
+        >
+          {isBuildingAutoFree ? 'Building...' : 'Auto Free Tier'}
+        </Button>
+      {/if}
+    </div>
+    <div class="flex gap-2">
+      {#if onDeleteSelected}
+        <Button
+          icon="delete"
+          onclick={onDeleteSelected}
+          disabled={selectedCount === 0}
+          variant="danger"
+          class="flex-1 whitespace-nowrap"
+        >
+          Delete Selected ({selectedCount})
+        </Button>
+      {/if}
+      {#if onDeleteAll}
+        <Button
+          icon="delete_sweep"
+          onclick={onDeleteAll}
+          disabled={deletableCount === 0}
+          variant="outline"
+          class="flex-1 whitespace-nowrap"
+        >
+          Delete All ({deletableCount})
+        </Button>
+      {/if}
+    </div>
   </div>
 </div>
