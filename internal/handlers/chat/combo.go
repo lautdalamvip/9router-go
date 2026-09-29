@@ -17,6 +17,7 @@ import (
 
 	"9router/proxy/internal/handlerutil"
 	"9router/proxy/internal/providers"
+	"9router/proxy/internal/translator"
 )
 
 // detectNewTurn reports whether the request body starts a new conversation
@@ -543,7 +544,8 @@ func (h *ChatHandler) handleComboFallback(ctx context.Context, w http.ResponseWr
 					fwdErr = h.tryForwardWithConnection(forwardRequestParams{
 						Ctx: ctx, W: cw, Provider: modelInfo.Provider, Model: modelInfo.Model,
 						ConnectionID: connID, ConnData: connData, Body: upstreamJSON,
-						IsStream: isStream, TranslateResponse: translateResponse, Endpoint: "/v1/chat/completions",
+						IsStream: isStream, TranslateResponse: translateResponse,
+						Endpoint: forwardEndpoint(ctx, "/v1/chat/completions"),
 					})
 				}
 
@@ -733,7 +735,8 @@ func (h *ChatHandler) handleMessagesComboFallback(ctx context.Context, w http.Re
 				fwdErr := h.tryForwardWithConnection(forwardRequestParams{
 					Ctx: ctx, W: cw, Provider: modelInfo.Provider, Model: modelInfo.Model,
 					ConnectionID: connID, ConnData: connData, Body: upstreamJSON,
-					IsStream: isStream, TranslateResponse: true, Endpoint: "/v1/messages",
+					IsStream: isStream, TranslateResponse: !translator.IsResponsesClient(ctx),
+					Endpoint: forwardEndpoint(ctx, "/v1/messages"),
 				})
 
 				if fwdErr != nil {
@@ -886,6 +889,12 @@ func (h *ChatHandler) comboLockRetryable(excludeIDs *[]string, connID, provider,
 	}
 	if lockKey != model {
 		_ = h.Repo.LockConnectionModel(connID, model, cooldownSec, cls.NewBackoffLevel)
+	}
+	// Account-scoped cooldown alongside the per-model locks, so the selector
+	// can skip this account before spending a request (upstream applyErrorState).
+	until := time.Now().UTC().Add(time.Duration(cooldownSec) * time.Second)
+	if err := h.Repo.LockConnectionRateLimit(connID, until, cls.NewBackoffLevel, ue.StatusCode, extractErrorText(ue.Body)); err != nil {
+		log.Warn("combo", "rate limit lock failed", "conn", connID, "error", err)
 	}
 	*excludeIDs = append(*excludeIDs, connID)
 	log.Warn("combo", "locked on retryable error", "provider", provider, "model", model, "lockKey", lockKey, "conn", connID, "status", ue.StatusCode, "cooldown_s", cooldownSec)

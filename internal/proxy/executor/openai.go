@@ -6,7 +6,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
+
+	json "encoding/json/v2"
 
 	"9router/proxy/internal/constants"
 	"9router/proxy/internal/log"
@@ -93,6 +96,16 @@ func sseStream(o sseStreamOpts) error {
 	translate, startTime := o.Translate, o.StartTime
 	ttft, buf := o.TTFT, o.Buf
 	ctx, toolNameMap := o.Ctx, o.ToolNameMap
+
+	// A /v1/responses client on a Chat Completions upstream needs the answer
+	// replayed as Responses events. The branch sits ahead of the header write
+	// because the bridge owns its own writer, and ahead of the Claude branch
+	// because translateResponse describes a Claude client, which a Responses
+	// client never sets.
+	if translator.NeedsResponsesBridge(ctx) {
+		return streamChatToResponses(o)
+	}
+
 	hw := proxy.NewHeartbeatWriter(ctx, w, 0)
 	defer hw.Close()
 	flusher := proxy.WriteSSEHeaders(hw)
@@ -244,8 +257,32 @@ func jsonResponse(ctx context.Context, w http.ResponseWriter, upstream io.Reader
 
 	body = translator.UnwrapClineEnvelope(body)
 
+	// An SSE-only upstream ignores `stream:false` and answers with an event
+	// stream anyway. Writing that under an `application/json` header hands the
+	// client text its JSON.parse cannot read, so fold the stream into one
+	// chat.completion first. A body whose first line is not `data:`/`event:`
+	// is not SSE and is left exactly as it was.
+	if looksLikeSSE(body) {
+		folded, ok := sseToOpenAIJSON(body)
+		if !ok {
+			// SSE-shaped but carrying no completion chunk. Relabelling it as
+			// JSON would repeat the bug, and a 502 lets combo fallback move
+			// on to the next account.
+			return sseWithoutCompletionError("upstream answered with an event stream containing no completion")
+		}
+		body = folded
+	}
+
 	if buf != nil {
 		buf.Write(body)
+	}
+
+	// A /v1/responses client on a Chat Completions upstream needs the answer in
+	// the Responses shape; translate marks a Claude client, which it is not.
+	// The raw Chat body still went to the log buffer and to usage parsing,
+	// exactly as it does for the Claude path.
+	if translator.NeedsResponsesBridge(ctx) {
+		return jsonResponseAsResponses(ctx, w, body)
 	}
 
 	if translate {
@@ -283,4 +320,53 @@ func jsonResponse(ctx context.Context, w http.ResponseWriter, upstream io.Reader
 	w.WriteHeader(http.StatusOK)
 	w.Write(body)
 	return nil
+}
+
+// looksLikeSSE reports whether a non-streaming body is actually an event
+// stream. Only the first non-empty line decides: a JSON body starts with `{`,
+// so requiring an SSE field prefix there cannot misfire on one.
+func looksLikeSSE(body []byte) bool {
+	for _, line := range strings.Split(string(body), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		return strings.HasPrefix(trimmed, "data:") || strings.HasPrefix(trimmed, "event:")
+	}
+	return false
+}
+
+// sseDataFrames returns the JSON payload of every `data:` frame.
+func sseDataFrames(body []byte) [][]byte {
+	var frames [][]byte
+	for _, line := range strings.Split(string(body), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(trimmed[5:])
+		if payload == "" {
+			continue
+		}
+		if payload == "[DONE]" {
+			continue
+		}
+		frames = append(frames, []byte(payload))
+	}
+	return frames
+}
+
+// sseWithoutCompletionError reports an event stream that carried no
+// completion chunk. Answering 200 with an empty body reads as a successful
+// empty completion and silently ends combo fallback, so this is a 502 the
+// fallback layer can act on.
+func sseWithoutCompletionError(message string) error {
+	body, _ := json.Marshal(map[string]any{
+		"error": map[string]any{
+			"message": message,
+			"type":    "upstream_error",
+			"code":    http.StatusBadGateway,
+		},
+	})
+	return &proxy.UpstreamError{StatusCode: http.StatusBadGateway, Body: body}
 }

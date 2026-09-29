@@ -17,10 +17,12 @@
   import type { Combo } from '../../api/client'
   import Card from '../../lib/ui/Card.svelte'
   import {
+    COMBO_STRATEGIES,
     getComboModels,
     hasReasoning,
     hasVision,
     isAutoFreeCombo,
+    resolveComboStrategy,
     type ComboStrategyInfo
   } from './types'
 
@@ -69,7 +71,7 @@
     onReorder?.(combo, next)
   }
   let isLocked = $derived(isAutoFreeCombo(combo))
-  let currentStrategy = $derived(strategyInfo.fallbackStrategy || combo.strategy || 'fallback')
+  let currentStrategy = $derived(resolveComboStrategy(strategyInfo.fallbackStrategy || combo.strategy))
   let judgeModel = $derived(strategyInfo.judgeModel || '')
   let isFusion = $derived(currentStrategy === 'fusion')
 </script>
@@ -182,9 +184,9 @@
           onchange={(e) => onSetStrategy(combo, e.currentTarget.value)}
           class="w-full bg-surface-2 border border-border rounded-lg px-2.5 py-1.5 text-xs text-text-main focus:outline-none focus:border-brand-500 cursor-pointer font-body"
         >
-          <option value="fallback">Fallback — try in order</option>
-          <option value="round-robin">Round Robin — rotate</option>
-          <option value="fusion">Fusion — panel + judge</option>
+          {#each COMBO_STRATEGIES as strategy (strategy.value)}
+            <option value={strategy.value}>{strategy.label}</option>
+          {/each}
         </select>
       </div>
 

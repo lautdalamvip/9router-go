@@ -66,8 +66,11 @@ func SetupRoutes(r interface {
 
 	// Media, Audio, Video & Web Tools Domain
 	r.Post("/embeddings", mediaH.HandleEmbeddings)
-	r.Post("/responses", mediaH.HandleResponses)
-	r.Post("/responses/compact", mediaH.HandleResponsesCompact)
+	// /v1/responses needs model resolution, combos, account fallback and usage
+	// logging, none of which the media passthrough has, so it lives with the
+	// chat handlers — the same place /v1/messages does.
+	r.Post("/responses", chatH.HandleResponses)
+	r.Post("/responses/compact", chatH.HandleResponsesCompact)
 	r.Post("/images/generations", mediaH.HandleImages)
 	r.Post("/audio/speech", mediaH.HandleAudioSpeech)
 	r.Get("/audio/voices", mediaH.HandleAudioVoices)
@@ -91,8 +94,11 @@ func SetupRoutes(r interface {
 	r.Post("/proxy-pools/cloudflare-deploy", mediaH.HandleCloudflareDeploy)
 
 	// CLI Tools Status Domain (dashboard batch status for installed CLI tools)
+	// The /api/cli-tools/all-statuses alias is registered in SetupServerRouter
+	// under RequireDashboardAuth instead — it is a dashboard read. Registering it
+	// here too would win the match under RequireApiKey and keep it unreachable
+	// from the session cookie the SPA actually sends.
 	r.Get("/cli-tools/all-statuses", media.NewCLIToolsHandler().HandleAllStatuses)
-	r.Get("/api/cli-tools/all-statuses", media.NewCLIToolsHandler().HandleAllStatuses)
 
 	// Headroom Management Domain (token-compression proxy lifecycle + dashboard proxy)
 	headroomH := media.NewHeadroomHandler(repo)
@@ -126,6 +132,8 @@ func SetupRoutes(r interface {
 	r.Get("/api/usage/request-details", HandleRequestDetails(repo))
 	r.Get("/api/usage/providers", dashH.HandleGetUsageProviders)
 	r.Get("/api/usage/{connectionId}", dashH.HandleGetConnectionUsage)
+	r.Get("/api/usage/{connectionId}/reset-credits", dashH.HandleListCodexResetCredits)
+	r.Post("/api/usage/{connectionId}/reset-credits/consume", dashH.HandleConsumeCodexResetCredit)
 
 	// Debug Tracing Domain (p50/p95 latency per provider+model)
 	r.Get("/debug/traces", HandleDebugTraces)
@@ -161,6 +169,9 @@ func SetupDashboardRoutes(r chi.Router, repo *db.Repo, chatH *chat.ChatHandler) 
 	r.Get("/api/usage/request-details", HandleRequestDetails(repo))
 	r.Get("/api/usage/providers", dashH.HandleGetUsageProviders)
 	r.Get("/api/usage/{connectionId}", dashH.HandleGetConnectionUsage)
+
+	r.Get("/api/usage/{connectionId}/reset-credits", dashH.HandleListCodexResetCredits)
+	r.Post("/api/usage/{connectionId}/reset-credits/consume", dashH.HandleConsumeCodexResetCredit)
 
 	r.Get("/api/provider-nodes", dashH.HandleGetProviderNodes)
 	r.Post("/api/provider-nodes", dashH.HandleCreateProviderNode)
@@ -418,6 +429,16 @@ func SetupServerRouter(r chi.Router, repo *db.Repo, ts *TokenSaverConfig) {
 	r.Group(func(r chi.Router) {
 		r.Use(middleware.RequireDashboardAuth(repo))
 		SetupDashboardRoutes(r, repo, versionH)
+	})
+
+	// CLI Tools status is a dashboard read: the SPA calls it with the session
+	// cookie, never an LLM API key. It was registered inside SetupRoutes, which
+	// is mounted under RequireApiKey, so every dashboard call 401'd and the view
+	// bounced to the endpoint tab. Reachable with a session, an API key, or the
+	// local CLI token — same policy as the rest of the dashboard group.
+	r.Group(func(r chi.Router) {
+		r.Use(middleware.RequireDashboardAuth(repo))
+		r.Get("/api/cli-tools/all-statuses", media.NewCLIToolsHandler().HandleAllStatuses)
 	})
 
 	SetupConsoleLogRoutes(r, repo)

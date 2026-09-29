@@ -148,6 +148,13 @@ func (h *ChatHandler) handleAccountFallback(
 			if lockKey != model {
 				_ = h.Repo.LockConnectionModel(connObj.ID, model, cooldownSec, classification.NewBackoffLevel)
 			}
+			// Account-scoped cooldown alongside the per-model locks, so the
+			// selector can skip this account before spending a request
+			// (upstream applyErrorState).
+			until := time.Now().UTC().Add(time.Duration(cooldownSec) * time.Second)
+			if lockErr := h.Repo.LockConnectionRateLimit(connObj.ID, until, classification.NewBackoffLevel, ue.StatusCode, errorText); lockErr != nil {
+				log.Warn("fallback", "rate limit lock failed", "conn", connObj.ID, "error", lockErr)
+			}
 			log.Warn("fallback", "connection locked", append([]any{
 				"conn", connObj.ID, "provider", provider, "model", model,
 				"lockKey", lockKey, "status", ue.StatusCode, "cooldown_s", cooldownSec,
@@ -442,6 +449,23 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 		}
 	}
 
+	// Codex answers an exhausted 5h/7d window with a 429 carrying
+	// usage_limit_reached and the exact reset. Caching it lets the next
+	// picker pass skip this account instead of spending a request to
+	// rediscover the same 429 (mirrors the Antigravity quota cache).
+	//
+	// When the body carries no reset, read live quota instead — throttled to
+	// one wham call per 30s per connection. That only blocks the account if
+	// the reading is actually exhausted, so a per-request or burst 429 on an
+	// otherwise healthy account caches a healthy reading and blocks nothing.
+	if errors.As(fwdErr, &ue) && provider == "codex" && connectionID != "" && ue.StatusCode == http.StatusTooManyRequests {
+		if resetAt := NoteCodexQuotaError(connectionID, ue.StatusCode, ue.Body); resetAt != nil {
+			log.Info("fallback", "codex quota exhausted, cached until reset", "conn", shortConnID(connectionID), "resetAt", resetAt.Format(time.RFC3339))
+		} else if _, qErr := RefreshCodexQuota(ctx, httpClient, connectionID, apiKey); qErr != nil {
+			log.Debug("fallback", "codex quota refresh failed", "conn", shortConnID(connectionID), "error", qErr)
+		}
+	}
+
 	latencyMs := time.Since(start).Milliseconds()
 
 	// Lightweight request trace for /debug/traces (provider/model latency).
@@ -475,6 +499,17 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 		}
 		if lockKey != model {
 			_ = h.Repo.UnlockConnectionModel(connectionID, model)
+		}
+		// A served request also clears the account-scoped cooldown, so an
+		// account that recovered is not kept out of rotation until the
+		// cooldown expires on its own.
+		if clearErr := h.Repo.ClearConnectionRateLimit(connectionID); clearErr != nil {
+			log.Warn("fallback", "rate limit clear failed", "conn", connectionID, "error", clearErr)
+		}
+		// A served request proves the account is usable again, so drop any
+		// cached quota block rather than leaving it to expire on its own.
+		if provider == "codex" {
+			ClearCodexQuotaBlock(connectionID)
 		}
 		if usage == nil {
 			usage = &translator.OpenAIUsage{}
