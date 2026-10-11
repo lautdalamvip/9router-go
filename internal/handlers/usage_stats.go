@@ -5,12 +5,86 @@ import (
 	"9router/proxy/internal/handlerutil"
 	"9router/proxy/internal/translator"
 	"9router/proxy/internal/usagetracker"
+	"database/sql"
 	json "encoding/json/v2"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 )
+
+// usagePeriod is the window /api/usage/stats aggregates over.
+type usagePeriod struct {
+	// daily reports whether the window is aggregated from usageDaily rows. The
+	// two sub-day windows instead scan raw usageHistory, because a daily rollup
+	// cannot express "since 14:00 yesterday".
+	daily bool
+	// days is the usageDaily row limit for a daily window.
+	days int
+	// since is the usageHistory cutoff for a raw-history window.
+	since time.Time
+	// shape names the window for the aggregate cache. It is decided here because
+	// this is where the difference is actually known: `today` starts at midnight
+	// and every poll in that day shares one start, while `24h` and `<n>h` are
+	// measured back from now and move on every request. Deriving it later from
+	// the instant alone cannot tell those apart.
+	shape windowShape
+}
+
+// allUsageDays bounds an unbounded period. usageDaily holds one row per calendar
+// day, so this covers every window this build can have written while keeping a
+// query parameter from asking for an unbounded scan.
+const allUsageDays = 3650
+
+// resolveUsagePeriod maps the ?period parameter onto a window. The named
+// shortcuts cover the dashboard presets; the <n>d and <n>h forms let a client ask
+// for a window that is not one of them.
+//
+// A zero day count means "unbounded", which only the explicit `all` shortcut
+// produces: a user-supplied 0 would otherwise silently read as the floor.
+func resolveUsagePeriod(raw string, now time.Time) usagePeriod {
+	if raw == "" {
+		raw = "today"
+	}
+
+	switch raw {
+	case "today":
+		day := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+		return usagePeriod{since: day, shape: anchoredShape(day)}
+	case "24h":
+		return usagePeriod{since: now.Add(-24 * time.Hour), shape: slidingShape(24 * time.Hour)}
+	case "all":
+		return usagePeriod{daily: true, days: allUsageDays}
+	}
+
+	if n, ok := usagePeriodCount(raw, "d"); ok {
+		return usagePeriod{daily: true, days: n}
+	}
+	if n, ok := usagePeriodCount(raw, "h"); ok {
+		span := time.Duration(n) * time.Hour
+		return usagePeriod{since: now.Add(-span), shape: slidingShape(span)}
+	}
+
+	// Unrecognized input falls back to the 7-day window rather than erroring: the
+	// dashboard keeps working against an older gateway that does not know a
+	// period, which is the common case when the SPA is newer than the server.
+	return usagePeriod{daily: true, days: 7}
+}
+
+// usagePeriodCount parses the "<n><unit>" shorthand, accepting only a positive
+// count with no sign or decimal part.
+func usagePeriodCount(raw, unit string) (int, bool) {
+	digits, ok := strings.CutSuffix(raw, unit)
+	if !ok || digits == "" {
+		return 0, false
+	}
+	n, err := strconv.Atoi(digits)
+	if err != nil || n <= 0 {
+		return 0, false
+	}
+	return n, true
+}
 
 type ProviderUsageItem struct {
 	Requests         int     `json:"requests"`
@@ -87,13 +161,12 @@ type UsageStatsResponse struct {
 	Pending               usagetracker.PendingState    `json:"pending"`
 }
 
-// HandleUsageStats returns aggregated stats for the specified period ("today", "24h", "7d", "30d", "60d").
+// HandleUsageStats aggregates usage over the window named by ?period. Besides the
+// dashboard presets ("today", "24h", "7d", "30d", "60d", "all") it accepts any
+// <n>d or <n>h window, so the selector is not limited to a fixed set.
 func HandleUsageStats(repo *db.Repo) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		period := r.URL.Query().Get("period")
-		if period == "" {
-			period = "today"
-		}
+		window := resolveUsagePeriod(r.URL.Query().Get("period"), time.Now())
 
 		tracker := usagetracker.GetTracker()
 		activeState := tracker.GetActiveState(repo)
@@ -182,227 +255,144 @@ func HandleUsageStats(repo *db.Repo) http.HandlerFunc {
 			resp.ByApiKey[bucketKey] = cur
 		}
 
-		useDailySummary := period != "today" && period != "24h"
-
-		if useDailySummary {
-			daysLimit := 7
-			if period == "30d" {
-				daysLimit = 30
-			} else if period == "60d" {
-				daysLimit = 60
-			} else if period == "all" {
-				daysLimit = 365
+		if window.daily {
+			dailyRows, err := repo.GetUsageDailyRecent(window.days)
+			if err != nil {
+				handlerutil.WriteJSONError(w, http.StatusInternalServerError, err.Error())
+				return
 			}
+			for _, rowJSON := range dailyRows {
+				var dayData map[string]any
+				if err := json.Unmarshal([]byte(rowJSON), &dayData); err != nil {
+					continue
+				}
 
-			dailyRows, err := repo.GetUsageDailyRecent(daysLimit)
-			if err == nil {
-				for _, rowJSON := range dailyRows {
-					var dayData map[string]any
-					if err := json.Unmarshal([]byte(rowJSON), &dayData); err != nil {
-						continue
-					}
-
-					// byProvider
-					if bp, ok := dayData["byProvider"].(map[string]any); ok {
-						for prov, pVal := range bp {
-							if pm, ok := pVal.(map[string]any); ok {
-								cur := resp.ByProvider[prov]
-								cur.Requests += getMapInt(pm, "requests")
-								cur.PromptTokens += getMapInt64(pm, "promptTokens")
-								cur.CompletionTokens += getMapInt64(pm, "completionTokens")
-								cur.CachedTokens += getMapInt64(pm, "cachedTokens")
-								cur.Cost += getMapFloat(pm, "cost")
-								resp.ByProvider[prov] = cur
-							}
+				// byProvider
+				if bp, ok := dayData["byProvider"].(map[string]any); ok {
+					for prov, pVal := range bp {
+						if pm, ok := pVal.(map[string]any); ok {
+							cur := resp.ByProvider[prov]
+							cur.Requests += getMapInt(pm, "requests")
+							cur.PromptTokens += getMapInt64(pm, "promptTokens")
+							cur.CompletionTokens += getMapInt64(pm, "completionTokens")
+							cur.CachedTokens += getMapInt64(pm, "cachedTokens")
+							cur.Cost += getMapFloat(pm, "cost")
+							resp.ByProvider[prov] = cur
 						}
 					}
+				}
 
-					// byModel
-					if bm, ok := dayData["byModel"].(map[string]any); ok {
-						for mk, mVal := range bm {
-							if mm, ok := mVal.(map[string]any); ok {
-								rawModel, _ := mm["rawModel"].(string)
-								prov, _ := mm["provider"].(string)
-								if rawModel == "" {
-									parts := strings.Split(mk, "|")
-									rawModel = parts[0]
-									if len(parts) > 1 && prov == "" {
-										prov = parts[1]
-									}
+				// byModel
+				if bm, ok := dayData["byModel"].(map[string]any); ok {
+					for mk, mVal := range bm {
+						if mm, ok := mVal.(map[string]any); ok {
+							rawModel, _ := mm["rawModel"].(string)
+							prov, _ := mm["provider"].(string)
+							if rawModel == "" {
+								parts := strings.Split(mk, "|")
+								rawModel = parts[0]
+								if len(parts) > 1 && prov == "" {
+									prov = parts[1]
 								}
-								statsKey := rawModel
-								if prov != "" {
-									statsKey = rawModel + " (" + prov + ")"
-								}
-								displayName := prov
-								if dn, ok := nodeNameMap[prov]; ok && dn != "" {
-									displayName = dn
-								}
-
-								cur := resp.ByModel[statsKey]
-								cur.RawModel = rawModel
-								cur.Provider = displayName
-								cur.Requests += getMapInt(mm, "requests")
-								cur.PromptTokens += getMapInt64(mm, "promptTokens")
-								cur.CompletionTokens += getMapInt64(mm, "completionTokens")
-								cur.CachedTokens += getMapInt64(mm, "cachedTokens")
-								cur.Cost += getMapFloat(mm, "cost")
-								resp.ByModel[statsKey] = cur
 							}
-						}
-					}
-
-					// byAccount
-					if ba, ok := dayData["byAccount"].(map[string]any); ok {
-						for connID, aVal := range ba {
-							if am, ok := aVal.(map[string]any); ok {
-								rawModel, _ := am["rawModel"].(string)
-								prov, _ := am["provider"].(string)
-								accName := connMap[connID]
-								if accName == "" {
-									if len(connID) > 8 {
-										accName = "Account " + connID[:8] + "..."
-									} else {
-										accName = "Account " + connID
-									}
-								}
-								accountKey := rawModel + " (" + prov + " - " + accName + ")"
-								displayName := prov
-								if dn, ok := nodeNameMap[prov]; ok && dn != "" {
-									displayName = dn
-								}
-
-								cur := resp.ByAccount[accountKey]
-								cur.RawModel = rawModel
-								cur.Provider = displayName
-								cur.ConnectionID = connID
-								cur.AccountName = accName
-								cur.Requests += getMapInt(am, "requests")
-								cur.PromptTokens += getMapInt64(am, "promptTokens")
-								cur.CompletionTokens += getMapInt64(am, "completionTokens")
-								cur.CachedTokens += getMapInt64(am, "cachedTokens")
-								cur.Cost += getMapFloat(am, "cost")
-								resp.ByAccount[accountKey] = cur
+							statsKey := rawModel
+							if prov != "" {
+								statsKey = rawModel + " (" + prov + ")"
 							}
-						}
-					}
-
-					// byApiKey. The daily payload carries no per-request timestamp
-					// (the date is the row key), so LastUsed stays empty here — same
-					// as the other daily branches.
-					if bak, ok := dayData["byApiKey"].(map[string]any); ok {
-						for _, kVal := range bak {
-							km, ok := kVal.(map[string]any)
-							if !ok {
-								continue
-							}
-							rawModel, _ := km["rawModel"].(string)
-							prov, _ := km["provider"].(string)
-							apiKey, _ := km["apiKey"].(string)
 							displayName := prov
 							if dn, ok := nodeNameMap[prov]; ok && dn != "" {
 								displayName = dn
 							}
-							addAPIKeyUsage(
-								apiKey, rawModel, prov, displayName, "",
-								getMapInt(km, "requests"),
-								getMapInt64(km, "promptTokens"),
-								getMapInt64(km, "completionTokens"),
-								getMapInt64(km, "cachedTokens"),
-								getMapFloat(km, "cost"),
-							)
+
+							cur := resp.ByModel[statsKey]
+							cur.RawModel = rawModel
+							cur.Provider = displayName
+							cur.Requests += getMapInt(mm, "requests")
+							cur.PromptTokens += getMapInt64(mm, "promptTokens")
+							cur.CompletionTokens += getMapInt64(mm, "completionTokens")
+							cur.CachedTokens += getMapInt64(mm, "cachedTokens")
+							cur.Cost += getMapFloat(mm, "cost")
+							resp.ByModel[statsKey] = cur
 						}
+					}
+				}
+
+				// byAccount
+				if ba, ok := dayData["byAccount"].(map[string]any); ok {
+					for connID, aVal := range ba {
+						if am, ok := aVal.(map[string]any); ok {
+							rawModel, _ := am["rawModel"].(string)
+							prov, _ := am["provider"].(string)
+							accName := connMap[connID]
+							if accName == "" {
+								if len(connID) > 8 {
+									accName = "Account " + connID[:8] + "..."
+								} else {
+									accName = "Account " + connID
+								}
+							}
+							accountKey := rawModel + " (" + prov + " - " + accName + ")"
+							displayName := prov
+							if dn, ok := nodeNameMap[prov]; ok && dn != "" {
+								displayName = dn
+							}
+
+							cur := resp.ByAccount[accountKey]
+							cur.RawModel = rawModel
+							cur.Provider = displayName
+							cur.ConnectionID = connID
+							cur.AccountName = accName
+							cur.Requests += getMapInt(am, "requests")
+							cur.PromptTokens += getMapInt64(am, "promptTokens")
+							cur.CompletionTokens += getMapInt64(am, "completionTokens")
+							cur.CachedTokens += getMapInt64(am, "cachedTokens")
+							cur.Cost += getMapFloat(am, "cost")
+							resp.ByAccount[accountKey] = cur
+						}
+					}
+				}
+
+				// byApiKey. The daily payload carries no per-request timestamp
+				// (the date is the row key), so LastUsed stays empty here — same
+				// as the other daily branches.
+				if bak, ok := dayData["byApiKey"].(map[string]any); ok {
+					for _, kVal := range bak {
+						km, ok := kVal.(map[string]any)
+						if !ok {
+							continue
+						}
+						rawModel, _ := km["rawModel"].(string)
+						prov, _ := km["provider"].(string)
+						apiKey, _ := km["apiKey"].(string)
+						displayName := prov
+						if dn, ok := nodeNameMap[prov]; ok && dn != "" {
+							displayName = dn
+						}
+						addAPIKeyUsage(
+							apiKey, rawModel, prov, displayName, "",
+							getMapInt(km, "requests"),
+							getMapInt64(km, "promptTokens"),
+							getMapInt64(km, "completionTokens"),
+							getMapInt64(km, "cachedTokens"),
+							getMapFloat(km, "cost"),
+						)
 					}
 				}
 			}
 		} else {
-			// Today or 24h: query usageHistory directly
-			var cutoff string
-			now := time.Now().UTC()
-			if period == "today" {
-				startOfDay := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
-				cutoff = startOfDay.Format(time.RFC3339)
-			} else {
-				cutoff = now.Add(-24 * time.Hour).Format(time.RFC3339)
+			// Sub-day windows read raw history: a daily rollup cannot express
+			// "since 14:00 yesterday".
+			//
+			// The fold is served from usageWindowCache, which builds a window's
+			// aggregate once and then advances it from a delta. The first read
+			// costs what the handler always cost; every poll after it reads only
+			// the rows written since the previous poll.
+			agg, err := rawWindows.getRawWindow(repo, window)
+			if err != nil {
+				handlerutil.WriteJSONError(w, http.StatusInternalServerError, err.Error())
+				return
 			}
-
-			histRows, err := repo.GetUsageHistorySince(cutoff)
-			if err == nil {
-				for _, r := range histRows {
-					promptTok := int64(r.PromptTokens)
-					complTok := int64(r.CompletionTokens)
-					cachedTok := int64(translator.CachedTokensFromJSON([]byte(r.Tokens)))
-					entryCost := r.Cost
-
-					provName := r.Provider
-					provDisplayName := provName
-					if dn, ok := nodeNameMap[provName]; ok && dn != "" {
-						provDisplayName = dn
-					}
-
-					// byProvider
-					if provName != "" {
-						p := resp.ByProvider[provName]
-						p.Requests++
-						p.PromptTokens += promptTok
-						p.CompletionTokens += complTok
-						p.CachedTokens += cachedTok
-						p.Cost += entryCost
-						resp.ByProvider[provName] = p
-					}
-
-					// byModel
-					modelKey := r.Model
-					if provName != "" {
-						modelKey = r.Model + " (" + provName + ")"
-					}
-					m := resp.ByModel[modelKey]
-					m.RawModel = r.Model
-					m.Provider = provDisplayName
-					m.Requests++
-					m.PromptTokens += promptTok
-					m.CompletionTokens += complTok
-					m.CachedTokens += cachedTok
-					m.Cost += entryCost
-					if r.Timestamp > m.LastUsed {
-						m.LastUsed = r.Timestamp
-					}
-					resp.ByModel[modelKey] = m
-
-					// byAccount
-					if r.ConnectionID != "" {
-						accName := connMap[r.ConnectionID]
-						if accName == "" {
-							if len(r.ConnectionID) > 8 {
-								accName = "Account " + r.ConnectionID[:8] + "..."
-							} else {
-								accName = "Account " + r.ConnectionID
-							}
-						}
-						accKey := r.Model + " (" + provName + " - " + accName + ")"
-						a := resp.ByAccount[accKey]
-						a.RawModel = r.Model
-						a.Provider = provDisplayName
-						a.ConnectionID = r.ConnectionID
-						a.AccountName = accName
-						a.Requests++
-						a.PromptTokens += promptTok
-						a.CompletionTokens += complTok
-						a.CachedTokens += cachedTok
-						a.Cost += entryCost
-						if r.Timestamp > a.LastUsed {
-							a.LastUsed = r.Timestamp
-						}
-						resp.ByAccount[accKey] = a
-					}
-
-					// byApiKey
-					addAPIKeyUsage(
-						r.APIKey, r.Model, provName, provDisplayName, r.Timestamp,
-						1, promptTok, complTok, cachedTok, entryCost,
-					)
-				}
-			}
+			applyRawAggregate(&resp, agg, nodeNameMap, connMap, keyNames)
 		}
 
 		// Calculate total aggregates from byProvider
@@ -415,50 +405,73 @@ func HandleUsageStats(repo *db.Repo) http.HandlerFunc {
 		}
 
 		// Build recent requests list (20 deduped from usageHistory)
-		if recentHistory, err := repo.GetRecentUsageHistory(60); err == nil {
-			var dedupedRecent []usagetracker.RecentRequest
-			seen := make(map[string]bool)
-			for _, rh := range recentHistory {
-				if rh.PromptTokens == 0 && rh.CompletionTokens == 0 {
-					continue
-				}
-				min := ""
-				if len(rh.Timestamp) >= 16 {
-					min = rh.Timestamp[:16]
-				}
-				k := rh.Model + "|" + rh.Provider + "|" + strconv.Itoa(rh.PromptTokens) + "|" + strconv.Itoa(rh.CompletionTokens) + "|" + min
-				if seen[k] {
-					continue
-				}
-				seen[k] = true
-
-				cachedTok := int(translator.CachedTokensFromJSON([]byte(rh.Tokens)))
-				status := "ok"
-				if rh.Status != "success" && rh.Status != "ok" && rh.Status != "" {
-					status = rh.Status
-				}
-
-				dedupedRecent = append(dedupedRecent, usagetracker.RecentRequest{
-					Timestamp:        rh.Timestamp,
-					Model:            rh.Model,
-					Provider:         rh.Provider,
-					PromptTokens:     rh.PromptTokens,
-					CompletionTokens: rh.CompletionTokens,
-					CachedTokens:     cachedTok,
-					Status:           status,
-				})
-				if len(dedupedRecent) >= 20 {
-					break
-				}
-			}
-			resp.RecentRequests = dedupedRecent
+		recentHistory, err := repo.GetRecentUsageHistory(60)
+		if err != nil {
+			handlerutil.WriteJSONError(w, http.StatusInternalServerError, err.Error())
+			return
 		}
+		var dedupedRecent []usagetracker.RecentRequest
+		seen := make(map[string]bool)
+		for _, rh := range recentHistory {
+			if rh.PromptTokens == 0 && rh.CompletionTokens == 0 {
+				continue
+			}
+			min := ""
+			if len(rh.Timestamp) >= 16 {
+				min = rh.Timestamp[:16]
+			}
+			k := rh.Model + "|" + rh.Provider + "|" + strconv.Itoa(rh.PromptTokens) + "|" + strconv.Itoa(rh.CompletionTokens) + "|" + min
+			if seen[k] {
+				continue
+			}
+			seen[k] = true
+
+			cachedTok := int(translator.CachedTokensFromJSON([]byte(rh.Tokens)))
+			status := "ok"
+			if rh.Status != "success" && rh.Status != "ok" && rh.Status != "" {
+				status = rh.Status
+			}
+
+			dedupedRecent = append(dedupedRecent, usagetracker.RecentRequest{
+				Timestamp:        rh.Timestamp,
+				Model:            rh.Model,
+				Provider:         rh.Provider,
+				PromptTokens:     rh.PromptTokens,
+				CompletionTokens: rh.CompletionTokens,
+				CachedTokens:     cachedTok,
+				Status:           status,
+			})
+			if len(dedupedRecent) >= 20 {
+				break
+			}
+		}
+		resp.RecentRequests = dedupedRecent
 
 		handlerutil.WriteJSON(w, http.StatusOK, resp)
 	}
 }
 
+// detailListItem is one collapsed Details-tab row.
+type detailListItem struct {
+	ID           string           `json:"id"`
+	Timestamp    string           `json:"timestamp"`
+	Provider     string           `json:"provider"`
+	Model        string           `json:"model"`
+	ConnectionID string           `json:"connectionId,omitempty"`
+	Status       string           `json:"status"`
+	Latency      map[string]int64 `json:"latency"`
+	Tokens       map[string]any   `json:"tokens"`
+	Account      string           `json:"account,omitempty"`
+	Cost         float64          `json:"cost,omitempty"`
+	Combo        string           `json:"combo,omitempty"`
+	Protocol     string           `json:"protocol,omitempty"`
+}
+
 // HandleRequestDetails returns paged request detail objects for the Details tab.
+//
+// Only the values the table renders travel in the list. The request messages and
+// response body stay in the database until /api/usage/request-detail/{id} is
+// called for the row a user opens, which turns a 400 KB page into a 4 KB one.
 func HandleRequestDetails(repo *db.Repo) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		limit := 50
@@ -474,25 +487,15 @@ func HandleRequestDetails(repo *db.Repo) http.HandlerFunc {
 			}
 		}
 
-		rawJSONs, total, err := repo.GetRequestDetailsPaged(limit, offset)
+		rows, total, err := repo.GetRequestDetailsPaged(limit, offset)
 		if err != nil {
-			handlerutil.WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			handlerutil.WriteJSONError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 
-		details := make([]any, 0, len(rawJSONs))
-		for _, raw := range rawJSONs {
-			var item map[string]any
-			if err := json.Unmarshal([]byte(raw), &item); err != nil {
-				continue
-			}
-			if tokens, ok := item["tokens"].(map[string]any); ok {
-				rawTokens, marshalErr := json.Marshal(tokens)
-				if marshalErr == nil {
-					tokens["cached_tokens"] = float64(translator.CachedTokensFromJSON(rawTokens))
-				}
-			}
-			details = append(details, item)
+		details := make([]detailListItem, 0, len(rows))
+		for _, row := range rows {
+			details = append(details, newDetailListItem(row))
 		}
 
 		handlerutil.WriteJSON(w, http.StatusOK, map[string]any{
@@ -501,6 +504,79 @@ func HandleRequestDetails(repo *db.Repo) http.HandlerFunc {
 			"limit":   limit,
 			"offset":  offset,
 		})
+	}
+}
+
+// newDetailListItem maps a collapsed row onto the wire shape, running the same
+// cached_tokens normalization the full-payload path applied, so a row reads the
+// same before and after the collapse.
+func newDetailListItem(row db.RequestDetailListRow) detailListItem {
+	tokens := map[string]any{}
+	if row.TokensJSON != "" {
+		if err := json.Unmarshal([]byte(row.TokensJSON), &tokens); err != nil {
+			tokens = map[string]any{}
+		}
+	}
+	if rawTokens, err := json.Marshal(tokens); err == nil {
+		tokens["cached_tokens"] = float64(translator.CachedTokensFromJSON(rawTokens))
+	}
+	account := row.Account
+	if account == "" {
+		if row.ConnectionID != "" {
+			account = row.ConnectionID
+		} else {
+			account = "Default"
+		}
+	}
+	protocol := row.Protocol
+	if protocol == "" {
+		protocol = "OpenAI-Chat"
+	}
+	return detailListItem{
+		ID:           row.ID,
+		Timestamp:    row.Timestamp,
+		Provider:     row.Provider,
+		Model:        row.Model,
+		ConnectionID: row.ConnectionID,
+		Status:       row.Status,
+		Latency:      map[string]int64{"ttft": row.LatencyTTFT, "total": row.LatencyTotal},
+		Tokens:       tokens,
+		Account:      account,
+		Cost:         row.Cost,
+		Combo:        row.Combo,
+		Protocol:     protocol,
+	}
+}
+
+// HandleRequestDetail serves the full stored payload for one request: the
+// request messages and the response body the list deliberately omits.
+func HandleRequestDetail(repo *db.Repo) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		raw, err := repo.GetRequestDetailByID(id)
+		if err != nil {
+			// A detail that was never recorded, or has since been pruned by
+			// retention, is a 404 rather than a server fault.
+			if errors.Is(err, sql.ErrNoRows) {
+				handlerutil.WriteJSONError(w, http.StatusNotFound, "request detail not found")
+				return
+			}
+			handlerutil.WriteJSONError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+
+		var item map[string]any
+		if err := json.Unmarshal([]byte(raw), &item); err != nil {
+			handlerutil.WriteJSONError(w, http.StatusInternalServerError, "stored request detail is unreadable")
+			return
+		}
+		if tokens, ok := item["tokens"].(map[string]any); ok {
+			if rawTokens, marshalErr := json.Marshal(tokens); marshalErr == nil {
+				tokens["cached_tokens"] = float64(translator.CachedTokensFromJSON(rawTokens))
+			}
+		}
+
+		handlerutil.WriteJSON(w, http.StatusOK, map[string]any{"detail": item})
 	}
 }
 

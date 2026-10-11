@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"net/http"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"9router/proxy/internal/db"
 )
 
 func TestApplyComboStrategy_capacity(t *testing.T) {
@@ -599,52 +602,45 @@ func TestApplyComboStrategy_roundRobinTurnAware(t *testing.T) {
 	}
 }
 
-func TestComboRetryAfter(t *testing.T) {
-	past := time.Now().Add(-1 * time.Second)
-	bounded := time.Now().Add(4 * time.Second)
-	tooFar := time.Now().Add(60 * time.Second)
-
+// A rate-limited account must not be retried once the upstream names a window
+// longer than brief429RetryTolerance; only a blip is worth another pass.
+func TestComboPassRetryWait(t *testing.T) {
 	tests := []struct {
-		name       string
-		retryAfter string
+		name        string
+		earliest    time.Duration
+		rateLimited bool
+		wantRetry   bool
 	}{
-		{"empty", ""},
-		{"invalid time", "not-a-time"},
-		{"past", past.Format(time.RFC3339)},
-		{"bounded", bounded.Format(time.RFC3339)},
-		{"exceeds cap", tooFar.Format(time.RFC3339)},
-	}
-	wants := map[string]time.Duration{
-		"empty":        0,
-		"invalid time": 0,
-		"past":         time.Second, // clamped to a minimum 1s wait
-		"bounded":      4 * time.Second,
-		"exceeds cap":  0, // too long -> surface Retry-After header instead
+		{"no retry-after", 0, false, false},
+		{"no retry-after rate limited", 0, true, false},
+		{"short 429 blip", time.Second, true, true},
+		{"429 exactly at tolerance", brief429RetryTolerance, true, true},
+		{"429 just past tolerance", brief429RetryTolerance + time.Millisecond, true, false},
+		{"429 quota window", 2 * time.Minute, true, false},
+		{"short transient failure", time.Second, false, true},
+		{"transient within old cap", comboRetryWaitCap, false, true},
+		{"transient past old cap", comboRetryWaitCap + time.Second, false, false},
 	}
 
 	for _, tt := range tests {
-		got := comboRetryAfter(tt.retryAfter)
-		want := wants[tt.name]
-		switch tt.name {
-		case "bounded":
-			// Allow the ceil() rounding to land on 4s or just either side of it.
-			if got <= 0 || got > comboRetryWaitCap {
-				t.Errorf("%s: comboRetryAfter = %v, want in (0, %v]", tt.name, got, comboRetryWaitCap)
+		t.Run(tt.name, func(t *testing.T) {
+			got := comboPassRetryWait(tt.earliest, tt.rateLimited)
+			if tt.wantRetry && got != tt.earliest {
+				t.Errorf("comboPassRetryWait(%v, %v) = %v, want %v", tt.earliest, tt.rateLimited, got, tt.earliest)
 			}
-		default:
-			if got != want {
-				t.Errorf("%s: comboRetryAfter = %v, want %v", tt.name, got, want)
+			if !tt.wantRetry && got != 0 {
+				t.Errorf("comboPassRetryWait(%v, %v) = %v, want 0 (no repeat pass)", tt.earliest, tt.rateLimited, got)
 			}
-		}
+		})
 	}
 }
 
 func TestAugmentModelsWithCapacityAdapter(t *testing.T) {
 	h := NewChatHandler(nil)
 
-	t.Run("No required capabilities returns original models", func(t *testing.T) {
+	t.Run("no repo means no pool", func(t *testing.T) {
 		models := []string{"deepseek/deepseek-chat"}
-		augmented, strat := h.AugmentModelsWithCapacityAdapter(models, nil)
+		augmented, strat := h.AugmentModelsWithCapacityAdapter(models, map[string]bool{"vision": true}, "")
 		if len(augmented) != 1 || augmented[0] != "deepseek/deepseek-chat" {
 			t.Errorf("expected original models, got %v", augmented)
 		}
@@ -653,41 +649,119 @@ func TestAugmentModelsWithCapacityAdapter(t *testing.T) {
 		}
 	})
 
-	t.Run("Model already satisfying vision is not augmented", func(t *testing.T) {
-		models := []string{"ag/gemini-3.8-flash-high"}
-		req := map[string]bool{"vision": true}
-		augmented, _ := h.AugmentModelsWithCapacityAdapter(models, req)
-		if len(augmented) != 1 || augmented[0] != "ag/gemini-3.8-flash-high" {
-			t.Errorf("expected no augmentation, got %v", augmented)
-		}
-	})
-
-	t.Run("Model lacking vision is augmented with vision adapter pool", func(t *testing.T) {
+	t.Run("soft-only requirement never triggers the pool", func(t *testing.T) {
 		models := []string{"deepseek/deepseek-chat"}
-		req := map[string]bool{"vision": true}
-		augmented, _ := h.AugmentModelsWithCapacityAdapter(models, req)
-		if len(augmented) != 2 {
-			t.Fatalf("expected 2 models after augmentation, got %v", augmented)
-		}
-		if augmented[0] != "ag/gemini-3.8-flash-high" {
-			t.Errorf("expected vision adapter model first, got %s", augmented[0])
-		}
-		if augmented[1] != "deepseek/deepseek-chat" {
-			t.Errorf("expected original model as fallback, got %s", augmented[1])
+		augmented, _ := h.AugmentModelsWithCapacityAdapter(models, map[string]bool{"tools": true}, "")
+		if len(augmented) != 1 {
+			t.Errorf("tools must not pull in an adapter pool, got %v", augmented)
 		}
 	})
+}
 
-	t.Run("Combo without vision is augmented with vision adapter pool", func(t *testing.T) {
-		models := []string{"deepseek/deepseek-chat", "openai/gpt-4"}
-		req := map[string]bool{"vision": true}
-		augmented, _ := h.AugmentModelsWithCapacityAdapter(models, req)
-		if len(augmented) != 3 {
-			t.Fatalf("expected 3 models after augmentation, got %v", augmented)
-		}
-		if augmented[0] != "ag/gemini-3.8-flash-high" {
-			t.Errorf("expected vision adapter model first, got %s", augmented[0])
-		}
-	})
+// Pool behavior with a real settings row, mirroring upstream
+// tests/unit/hermes-vision-detection.test.js.
+func TestAugmentModelsWithCapacityAdapter_Pool(t *testing.T) {
+	tests := []struct {
+		name       string
+		settings   string
+		models     []string
+		required   map[string]bool
+		wantModels []string
+		wantStrat  string
+	}{
+		{
+			name:     "enabled pool prepends a capable model",
+			settings: `{"capacityAdapter":{"vision":{"enabled":true,"models":["ag/gemini-3.8-flash-high"]}}}`,
+			models:   []string{"deepseek/deepseek-chat"},
+			required: map[string]bool{"vision": true},
+			// A disabled pool must inject nothing; an enabled one prepends.
+			wantModels: []string{"ag/gemini-3.8-flash-high", "deepseek/deepseek-chat"},
+			wantStrat:  "fallback",
+		},
+		{
+			name:       "disabled pool injects nothing",
+			settings:   `{"capacityAdapter":{"vision":{"enabled":false,"models":["ag/gemini-3.8-flash-high"]}}}`,
+			models:     []string{"deepseek/deepseek-chat"},
+			required:   map[string]bool{"vision": true},
+			wantModels: []string{"deepseek/deepseek-chat"},
+			wantStrat:  "fallback",
+		},
+		{
+			name:       "enabled but empty pool falls back to the default model",
+			settings:   `{"capacityAdapter":{"vision":{"enabled":true,"models":[]}}}`,
+			models:     []string{"deepseek/deepseek-chat"},
+			required:   map[string]bool{"vision": true},
+			wantModels: []string{"oc/mimo-v2.6-flash-free", "deepseek/deepseek-chat"},
+			wantStrat:  "fallback",
+		},
+		{
+			name:       "legacy array pool entry is treated as enabled",
+			settings:   `{"capacityAdapter":{"vision":[{"model":"ag/gemini-3.8-flash-high"}]}}`,
+			models:     []string{"deepseek/deepseek-chat"},
+			required:   map[string]bool{"vision": true},
+			wantModels: []string{"ag/gemini-3.8-flash-high", "deepseek/deepseek-chat"},
+			wantStrat:  "fallback",
+		},
+		{
+			name:       "round-robin pool drives the augmented list",
+			settings:   `{"capacityAdapter":{"vision":{"enabled":true,"roundRobin":true,"models":["ag/gemini-3.8-flash-high"]}}}`,
+			models:     []string{"deepseek/deepseek-chat"},
+			required:   map[string]bool{"vision": true},
+			wantModels: []string{"ag/gemini-3.8-flash-high", "deepseek/deepseek-chat"},
+			wantStrat:  "round-robin",
+		},
+		{
+			name:       "model already capable is left alone",
+			settings:   `{"capacityAdapter":{"vision":{"enabled":true,"models":["ag/gemini-3.8-flash-high"]}}}`,
+			models:     []string{"ag/gemini-3.8-flash-high"},
+			required:   map[string]bool{"vision": true},
+			wantModels: []string{"ag/gemini-3.8-flash-high"},
+			wantStrat:  "fallback",
+		},
+		{
+			name:       "pool member without the capability is dropped",
+			settings:   `{"capacityAdapter":{"vision":{"enabled":true,"models":["deepseek/deepseek-chat"]}}}`,
+			models:     []string{"groq/llama-3-70b"},
+			required:   map[string]bool{"vision": true},
+			wantModels: []string{"groq/llama-3-70b"},
+			wantStrat:  "fallback",
+		},
+		{
+			name:       "a combo name in the pool never satisfies a hard cap",
+			settings:   `{"capacityAdapter":{"vision":{"enabled":true,"models":["vision-combo"]}}}`,
+			models:     []string{"deepseek/deepseek-chat"},
+			required:   map[string]bool{"vision": true},
+			wantModels: []string{"deepseek/deepseek-chat"},
+			wantStrat:  "fallback",
+		},
+		{
+			name:       "legacy model id is upgraded",
+			settings:   `{"capacityAdapter":{"vision":{"enabled":true,"models":["oc/mimo-v2.5-free"]}}}`,
+			models:     []string{"deepseek/deepseek-chat"},
+			required:   map[string]bool{"vision": true},
+			wantModels: []string{"oc/mimo-v2.6-flash-free", "deepseek/deepseek-chat"},
+			wantStrat:  "fallback",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			database, cleanup := setupChatTestDB(t)
+			defer cleanup()
+			if _, err := database.Exec(`INSERT INTO settings (id, data) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET data = excluded.data`, tt.settings); err != nil {
+				t.Fatalf("seed settings: %v", err)
+			}
+			h := NewChatHandler(db.NewRepo(database))
+
+			got, strat := h.AugmentModelsWithCapacityAdapter(tt.models, tt.required, "")
+			if !slices.Equal(got, tt.wantModels) {
+				t.Errorf("AugmentModelsWithCapacityAdapter() = %v, want %v", got, tt.wantModels)
+			}
+			if strat != tt.wantStrat {
+				t.Errorf("strategy = %q, want %q", strat, tt.wantStrat)
+			}
+		})
+	}
 }
 
 // A combo whose own models cannot serve a request has the capacity-adapter
@@ -696,14 +770,23 @@ func TestAugmentModelsWithCapacityAdapter(t *testing.T) {
 // the combo's model and a provider that is not in the combo at all, which read
 // as traffic leaking out of the combo.
 func TestApplyCapacityAdapter_DoesNotFoldAdapterIntoComboRotation(t *testing.T) {
-	h := NewChatHandler(nil)
+	database, cleanup := setupChatTestDB(t)
+	defer cleanup()
+	if _, err := database.Exec(`INSERT INTO settings (id, data) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET data = excluded.data`,
+		`{"capacityAdapter":{"vision":{"enabled":true,"models":["ag/gemini-3.8-flash-high"]}}}`); err != nil {
+		t.Fatalf("seed settings: %v", err)
+	}
+	h := NewChatHandler(db.NewRepo(database))
 	comboModels := []string{"oc/space-bunny-free"}
 
 	t.Run("vision turn is governed by the adapter strategy, not the combo's", func(t *testing.T) {
-		augmented, strategy := h.applyCapacityAdapter(comboModels, map[string]bool{"vision": true}, "round-robin", "combo-wombo")
+		augmented, strategy, injected := h.applyCapacityAdapter(comboModels, map[string]bool{"vision": true}, "round-robin", "combo-wombo", "")
 
-		if len(augmented) != 2 || augmented[0] != "ag/gemini-3.8-flash-high" {
+		if !slices.Equal(augmented, []string{"ag/gemini-3.8-flash-high", "oc/space-bunny-free"}) {
 			t.Fatalf("expected the vision adapter model prepended, got %v", augmented)
+		}
+		if !slices.Equal(injected, []string{"ag/gemini-3.8-flash-high"}) {
+			t.Fatalf("injected = %v, want the pool entry only", injected)
 		}
 		if strategy == "round-robin" {
 			t.Fatalf("adapter model must not join the combo rotation, got strategy %q", strategy)
@@ -723,10 +806,13 @@ func TestApplyCapacityAdapter_DoesNotFoldAdapterIntoComboRotation(t *testing.T) 
 	})
 
 	t.Run("text-only turn keeps the combo's own strategy and list", func(t *testing.T) {
-		augmented, strategy := h.applyCapacityAdapter(comboModels, map[string]bool{"tools": true}, "round-robin", "combo-wombo")
+		augmented, strategy, injected := h.applyCapacityAdapter(comboModels, map[string]bool{"tools": true}, "round-robin", "combo-wombo", "")
 
 		if len(augmented) != 1 || augmented[0] != "oc/space-bunny-free" {
 			t.Fatalf("expected an untouched list, got %v", augmented)
+		}
+		if injected != nil {
+			t.Errorf("no pool was injected, got %v", injected)
 		}
 		if strategy != "round-robin" {
 			t.Fatalf("combo strategy must survive when nothing was injected, got %q", strategy)

@@ -187,7 +187,10 @@ func ConcealFingerprintTools(body []byte) ([]byte, map[string]string) {
 			m["tool_choice"] = "none"
 		}
 	}
-	out, err := json.Marshal(m)
+	// Deterministic marshaling keeps the serialized request prefix stable
+	// across the turns of a session, which prefix-caching upstreams
+	// (deepseek) require; json/v2 randomizes map member order by default.
+	out, err := json.Marshal(m, json.Deterministic(true))
 	if err != nil {
 		return body, noop
 	}
@@ -210,12 +213,26 @@ func RestoreToolNames(payload []byte, toolNameMap map[string]string) []byte {
 
 	changed := false
 
-	// Claude: content_block_start with content_block.type == "tool_use"
+	// Claude streaming: content_block_start with content_block.type == "tool_use"
 	if block, ok := m["content_block"].(map[string]any); ok && block["type"] == "tool_use" {
 		if n, ok := block["name"].(string); ok {
 			if orig, found := toolNameMap[n]; found {
 				block["name"] = orig
 				changed = true
+			}
+		}
+	}
+
+	// Claude non-streaming: content[] with type == "tool_use"
+	if content, ok := m["content"].([]any); ok {
+		for _, item := range content {
+			if im, ok := item.(map[string]any); ok && im["type"] == "tool_use" {
+				if n, ok := im["name"].(string); ok {
+					if orig, found := toolNameMap[n]; found {
+						im["name"] = orig
+						changed = true
+					}
+				}
 			}
 		}
 	}
@@ -232,26 +249,32 @@ func RestoreToolNames(payload []byte, toolNameMap map[string]string) []byte {
 				if !ok {
 					continue
 				}
-				calls, ok := h["tool_calls"].([]any)
-				if !ok {
-					continue
+				if calls, ok := h["tool_calls"].([]any); ok {
+					for _, call := range calls {
+						cm, ok := call.(map[string]any)
+						if !ok {
+							continue
+						}
+						fn, ok := cm["function"].(map[string]any)
+						if !ok {
+							continue
+						}
+						n, ok := fn["name"].(string)
+						if !ok || n == "" {
+							continue
+						}
+						if orig, found := toolNameMap[n]; found {
+							fn["name"] = orig
+							changed = true
+						}
+					}
 				}
-				for _, call := range calls {
-					cm, ok := call.(map[string]any)
-					if !ok {
-						continue
-					}
-					fn, ok := cm["function"].(map[string]any)
-					if !ok {
-						continue
-					}
-					n, ok := fn["name"].(string)
-					if !ok || n == "" {
-						continue
-					}
-					if orig, found := toolNameMap[n]; found {
-						fn["name"] = orig
-						changed = true
+				if fc, ok := h["function_call"].(map[string]any); ok {
+					if n, ok := fc["name"].(string); ok && n != "" {
+						if orig, found := toolNameMap[n]; found {
+							fc["name"] = orig
+							changed = true
+						}
 					}
 				}
 			}
@@ -278,6 +301,45 @@ func RestoreToolNames(payload []byte, toolNameMap map[string]string) []byte {
 		}
 	}
 
+	// Responses streaming: item.type == function_call / custom_tool_call
+	if item, ok := m["item"].(map[string]any); ok {
+		t, _ := item["type"].(string)
+		if t == "function_call" || t == "custom_tool_call" {
+			if n, ok := item["name"].(string); ok {
+				if orig, found := toolNameMap[n]; found {
+					item["name"] = orig
+					changed = true
+				}
+			}
+		}
+	}
+
+	// Gemini native: candidates[].content.parts[].functionCall.name
+	if candidates, ok := m["candidates"].([]any); ok {
+		for _, c := range candidates {
+			if cm, ok := c.(map[string]any); ok {
+				if content, ok := cm["content"].(map[string]any); ok {
+					if parts, ok := content["parts"].([]any); ok {
+						for _, p := range parts {
+							if pm, ok := p.(map[string]any); ok {
+								if fc, ok := pm["functionCall"].(map[string]any); ok {
+									if n, ok := fc["name"].(string); ok {
+										if orig, found := toolNameMap[n]; found {
+											fc["name"] = orig
+											changed = true
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	if restoreConverseToolNames(m, toolNameMap) {
+		changed = true
+	}
 	if !changed {
 		return payload
 	}
@@ -366,6 +428,17 @@ func WithToolNameMap(ctx context.Context, toolNameMap map[string]string) context
 	}
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	existing := ToolNameMapFromContext(ctx)
+	if len(existing) > 0 {
+		merged := make(map[string]string, len(existing)+len(toolNameMap))
+		for k, v := range existing {
+			merged[k] = v
+		}
+		for k, v := range toolNameMap {
+			merged[k] = v
+		}
+		return context.WithValue(ctx, contextKeyToolNameMap{}, merged)
 	}
 	return context.WithValue(ctx, contextKeyToolNameMap{}, toolNameMap)
 }

@@ -27,20 +27,18 @@ import (
 //     refreshes with configs we do not carry (kimi, kimi-coding, kiro) report
 //     "Token expired"/"Token invalid or revoked" instead of silently refreshing.
 //   - Upstream's proactive codex "maxRefreshAgeMs" stale-window refresh is not
-//     ported; the plain expiresAt lead window below is used for every provider.
+//     ported; the expiresAt lead window below is used for every provider, at
+//     the width that provider's registry entry asks for (providers.RefreshLead)
+//     rather than the flat default upstream falls back to.
 const (
 	// connectionProbeTimeout mirrors upstream's AbortSignal.timeout(15000).
 	connectionProbeTimeout = 15 * time.Second
 	// connectionProxyProbeTimeout mirrors the proxy pool test timeout.
 	connectionProxyProbeTimeout = 5 * time.Second
-	// connectionRefreshLead mirrors getRefreshLeadMs' default buffer
-	// (TOKEN_EXPIRY_BUFFER_MS = 5 minutes).
-	connectionRefreshLead = 5 * time.Minute
 
-	connectionAnthropicProbeModel = "claude-3-haiku-20240307"
-	codexCLIVersion               = "0.154.0"
+	codexCLIVersion               = providers.CodexCLIVersion
 	grokCLIProbeURL               = "https://cli-chat-proxy.grok.com/v1/user"
-	grokCLIProbeUA                = "grok-pager/0.2.93 grok-shell/0.2.93 (linux; x86_64)"
+	grokCLIProbeUA                = providers.GrokCLIPagerUserAgent
 	kimchiProbeURL                = "https://api.cast.ai/v1/llm/openai/supported-providers"
 	kilocodeProbeURL              = "https://api.kilo.ai/api/profile"
 	clineProbeURL                 = "https://api.cline.bot/api/v1/users/me"
@@ -48,9 +46,36 @@ const (
 	codexProbeURL                 = "https://chatgpt.com/backend-api/codex/responses"
 	cloudCodeAssistProbeURL       = "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
 	cloudCodeAssistProbeBody      = `{"metadata":{"ideType":"IDE_UNSPECIFIED","platform":"PLATFORM_UNSPECIFIED","pluginType":"GEMINI"}}`
+	// Meta's Model API lists its own catalogue for the credential that is
+	// being tested, which is the same call the dashboard's live-model import
+	// makes — a 401/403 is the only invalid answer. This is the Muse Code
+	// subscription's connection probe as well as the pasted API key's: both
+	// store the minted Model API key as the bearer token.
+	museProbeURL    = "https://api.meta.ai/v1/models"
+	museProbeAPIKey = "muse-spark-1.3"
+	// v1m has no /models endpoint; the cheapest call that proves a key is a
+	// single-token System One evaluation (upstream validateUrl defaults to
+	// the provider's chat base URL).
+	v1mProbeURL   = "https://v1m.ir/v1/systemone"
+	v1mProbeModel = "rev-latest"
+	// MiniMax Code publishes its model catalogue on the agent gateway (the
+	// same endpoint the dashboard imports from), so a connection probe is a
+	// plain bearer call there: a 401/403 is the only invalid answer.
+	miniMaxCodeCatalogURL       = "https://agent.minimax.cn/mavis/api/v1/models?region=cn&buildEnv=prod"
+	miniMaxCodeGlobalCatalogURL = "https://agent.minimax.io/mavis/api/v1/models?region=en&buildEnv=prod"
 	// Upstream accepts any non-401/403 answer as proof the credentials work.
 	connectionBrowserUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
 )
+
+// AnthropicValidationModel is the model an Anthropic-compatible endpoint is
+// probed with when the connection names none itself — no defaultModel and no
+// providerSpecificData.assignedModel — for both the dashboard connection test
+// and provider-node validation. Upstream hardcoded "claude-3-haiku-20240307",
+// which Anthropic has since retired, so probing a valid API key against it
+// now fails. The id is the one the model registry and pricing tables already
+// carry ("claude-haiku-4-5-20251001"), so a probe never names a model the rest
+// of the app does not know.
+const AnthropicValidationModel = "claude-haiku-4-5-20251001"
 
 // connectionProbeData is the connection blob the probe reads, mirroring the
 // fields upstream's testUtils.js touches.
@@ -146,8 +171,7 @@ var oauthProbeConfigs = map[string]oauthProbeConfig{
 		url:            codexProbeURL,
 		method:         http.MethodPost,
 		authHeader:     "Authorization",
-		authPrefix:     "Bearer ",
-		extraHeaders:   map[string]string{"Content-Type": "application/json", "originator": "codex_cli_rs", "User-Agent": "codex_cli_rs/" + codexCLIVersion},
+		extraHeaders:   map[string]string{"Content-Type": "application/json", "originator": "codex_cli_rs", "User-Agent": providers.CodexCLIUserAgent, "version": providers.CodexCLIVersionHeader},
 		body:           `{"model":"gpt-5.3-codex","input":[],"stream":false,"store":false}`,
 		acceptStatuses: []int{http.StatusBadRequest},
 		refreshable:    true,
@@ -176,6 +200,23 @@ var oauthProbeConfigs = map[string]oauthProbeConfig{
 	"qoder-cn":       {url: "https://openapi.qoder.com.cn/api/v1/userinfo", method: http.MethodGet, authHeader: "Authorization", authPrefix: "Bearer "},
 	"kimi":           {checkExpiry: true, refreshable: true},
 	"kimi-coding":    {checkExpiry: true, refreshable: true},
+	// MiniMax Code publishes its own catalogue on the agent gateway, so the
+	// probe proves the credential the same way the quota read does — and the
+	// token is refreshable, unlike the API-key MiniMax providers.
+	"minimax-code":        {url: miniMaxCodeCatalogURL, method: http.MethodGet, authHeader: "Authorization", authPrefix: "Bearer ", checkExpiry: true, refreshable: true},
+	"minimax-code-global": {url: miniMaxCodeGlobalCatalogURL, method: http.MethodGet, authHeader: "Authorization", authPrefix: "Bearer ", checkExpiry: true, refreshable: true},
+	// A Muse Code subscription stores the minted Model API key as its bearer
+	// token, so the catalogue call proves the credential exactly the same way
+	// it does for a pasted dev.meta.ai key — and there is nothing to refresh,
+	// which is why refreshable stays off.
+	"muse": {
+		url: museProbeURL, method: http.MethodGet,
+		authHeader: "Authorization", authPrefix: "Bearer ",
+		extraHeaders: map[string]string{
+			"Accept":        "application/json",
+			"x-api-version": "1.0.0",
+		},
+	},
 	"cursor":         {tokenExists: true},
 	"kilocode":       {url: kilocodeProbeURL, method: http.MethodGet, authHeader: "Authorization", authPrefix: "Bearer "},
 	"cline":          {refreshable: true},
@@ -201,8 +242,8 @@ var oauthProbeConfigs = map[string]oauthProbeConfig{
 			"Accept":                   "application/json",
 			"User-Agent":               grokCLIProbeUA,
 			"x-xai-token-auth":         "xai-grok-cli",
-			"x-grok-client-identifier": "grok-pager",
-			"x-grok-client-version":    "0.2.93",
+			"x-grok-client-identifier": providers.GrokCLIPagerIdentifier,
+			"x-grok-client-version":    providers.GrokCLIVersion,
 		},
 		refreshable:    true,
 		acceptStatuses: []int{http.StatusPaymentRequired},
@@ -217,8 +258,8 @@ var oauthProbeConfigs = map[string]oauthProbeConfig{
 			"Accept":                   "application/json",
 			"User-Agent":               grokCLIProbeUA,
 			"x-xai-token-auth":         "xai-grok-cli",
-			"x-grok-client-identifier": "grok-pager",
-			"x-grok-client-version":    "0.2.93",
+			"x-grok-client-identifier": providers.GrokCLIPagerIdentifier,
+			"x-grok-client-version":    providers.GrokCLIVersion,
 		},
 		refreshable:    true,
 		acceptStatuses: []int{http.StatusPaymentRequired},
@@ -302,20 +343,26 @@ func (h *DashboardHandler) testSingleConnection(ctx context.Context, conn *model
 
 // probeHTTPClient resolves the connection's proxy the way the chat pipeline
 // does (proxy pool first, then the legacy per-connection proxy fields) and
-// returns a client bound to it plus the proxy URL when it is a plain HTTP
-// proxy. Relay pools (vercel/cloudflare/deno) are not dialed as proxies, so
-// they fall back to the default client exactly like chat's resolver.
+// returns the client a probe should dial with plus the proxy URL when it is a
+// plain HTTP proxy worth pre-checking.
+//
+// A relay pool (vercel/cloudflare/deno) is not dialed as an HTTP proxy, so it
+// gets a client that points at the relay host and carries the provider in
+// x-relay-target/x-relay-path — the same contract the chat pipeline uses. It
+// previously returned nil here, which made every "Test Connection" on a
+// relayed connection run straight at the provider from the host's own IP.
 func (h *DashboardHandler) probeHTTPClient(data connectionProbeData, raw map[string]any) (*http.Client, string) {
 	poolID := psdStr(data.ProviderSpecificData, "proxyPoolId")
 	if poolID == "" {
 		poolID = psdStr(raw, "proxyPoolId")
 	}
 
-	var proxyURLStr, proxyType string
+	var proxyURLStr string
+	edgeRelay := false
 	if poolID != "" {
 		if pool, err := h.Repo.GetProxyPool(poolID); err == nil && pool != nil && pool.IsActive {
 			proxyURLStr = pool.NextURL()
-			proxyType = pool.Type
+			edgeRelay = pool.IsEdgeRelay()
 		}
 	}
 	if proxyURLStr == "" {
@@ -331,14 +378,13 @@ func (h *DashboardHandler) probeHTTPClient(data connectionProbeData, raw map[str
 		}
 		if enabled && target != "" {
 			proxyURLStr = target
-			proxyType = "http"
 		}
 	}
 	if proxyURLStr == "" {
 		return nil, ""
 	}
-	if proxyType == "vercel" || proxyType == "cloudflare" || proxyType == "deno" {
-		return nil, ""
+	if edgeRelay {
+		return newProbeRelayClient(proxyURLStr, probeUpstreamURL(data, raw)), ""
 	}
 
 	parsed, err := url.Parse(proxyURLStr)
@@ -349,6 +395,24 @@ func (h *DashboardHandler) probeHTTPClient(data connectionProbeData, raw map[str
 		Transport: &http.Transport{Proxy: http.ProxyURL(parsed)},
 		Timeout:   connectionProbeTimeout,
 	}, proxyURLStr
+}
+
+// probeUpstreamURL is the provider endpoint a probe should be aimed at, from
+// whichever field the connection carries. Empty means the provider's registry
+// default is in play and the probe's own URL stands.
+func probeUpstreamURL(data connectionProbeData, raw map[string]any) string {
+	for _, key := range []string{"baseUrl", "baseURL"} {
+		if v := psdStr(data.ProviderSpecificData, key); v != "" {
+			return v
+		}
+		if v := psdStr(raw, key); v != "" {
+			return v
+		}
+	}
+	if data.ConnectionProxyURL != "" {
+		return data.ConnectionProxyURL
+	}
+	return ""
 }
 
 // probeProxyURL pre-checks a proxy before probing through it (upstream runs
@@ -446,7 +510,7 @@ func (h *DashboardHandler) probeCompatibleConnection(ctx context.Context, conn *
 			model = psdStr(data.ProviderSpecificData, "assignedModel")
 		}
 		if model == "" {
-			model = connectionAnthropicProbeModel
+			model = AnthropicValidationModel
 		}
 		body, _ := json.Marshal(map[string]any{
 			"model":      model,
@@ -522,7 +586,7 @@ func (h *DashboardHandler) probeOAuthConnection(ctx context.Context, conn *model
 	refreshed := false
 	var tokens *oauth.TokenResult
 
-	tokenExpired := connectionTokenExpired(data)
+	tokenExpired := connectionTokenExpired(provider, data)
 	if cfg.refreshable && tokenExpired && data.RefreshToken != "" {
 		tokens = h.refreshConnectionToken(ctx, provider, data, client)
 		if tokens == nil {
@@ -841,7 +905,7 @@ func (h *DashboardHandler) refreshConnectionToken(ctx context.Context, provider 
 
 // connectionTokenExpired mirrors shouldRefreshCredentials' expiresAt window.
 // An absent/unknown expiresAt means "not expired" (upstream returns false).
-func connectionTokenExpired(data connectionProbeData) bool {
+func connectionTokenExpired(provider string, data connectionProbeData) bool {
 	if data.ExpiresAt == "" {
 		return false
 	}
@@ -849,7 +913,7 @@ func connectionTokenExpired(data connectionProbeData) bool {
 	if err != nil {
 		return false
 	}
-	return time.Now().After(expiresAt.Add(-connectionRefreshLead))
+	return time.Now().After(expiresAt.Add(-providers.RefreshLead(provider)))
 }
 
 // persistProbeResult writes the probe outcome back to the connection row:

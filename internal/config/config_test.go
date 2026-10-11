@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -152,6 +153,7 @@ MACHINE_ID_SALT=dotenv-salt
 RTK_ENABLED=false
 CAVEMAN_ENABLED=true
 PONYTAIL_ENABLED=true
+ADHD_ENABLED=true
 `
 	envFile := filepath.Join(tempDir, ".env")
 	if err := os.WriteFile(envFile, []byte(envContent), 0600); err != nil {
@@ -189,6 +191,9 @@ PONYTAIL_ENABLED=true
 	if cfg.PonytailEnabled != true {
 		t.Errorf("expected ponytail true from .env, got %v", cfg.PonytailEnabled)
 	}
+	if cfg.ADHDEnabled != true {
+		t.Errorf("expected adhd true from .env, got %v", cfg.ADHDEnabled)
+	}
 }
 
 func TestEnvPrecedenceOverDotEnv(t *testing.T) {
@@ -199,6 +204,7 @@ MACHINE_ID_SALT=dotenv-salt
 RTK_ENABLED=false
 CAVEMAN_ENABLED=false
 PONYTAIL_ENABLED=false
+ADHD_ENABLED=false
 `
 	envFile := filepath.Join(tempDir, ".env")
 	if err := os.WriteFile(envFile, []byte(envContent), 0600); err != nil {
@@ -212,6 +218,7 @@ PONYTAIL_ENABLED=false
 	t.Setenv("RTK_ENABLED", "true")
 	t.Setenv("CAVEMAN_ENABLED", "true")
 	t.Setenv("PONYTAIL_ENABLED", "true")
+	t.Setenv("ADHD_ENABLED", "true")
 
 	v := NewViperWithFile(envFile)
 	cfg := LoadConfigFromViper(v)
@@ -233,6 +240,9 @@ PONYTAIL_ENABLED=false
 	}
 	if cfg.PonytailEnabled != true {
 		t.Errorf("expected OS env PONYTAIL_ENABLED true to override .env, got %v", cfg.PonytailEnabled)
+	}
+	if cfg.ADHDEnabled != true {
+		t.Errorf("expected OS env ADHD_ENABLED true to override .env, got %v", cfg.ADHDEnabled)
 	}
 }
 
@@ -264,5 +274,131 @@ func TestLoadConfig_HostAndBindAddr(t *testing.T) {
 	cfg2 := LoadConfig()
 	if cfg2.Host != "0.0.0.0" {
 		t.Errorf("expected host 0.0.0.0 from BIND_ADDR, got %s", cfg2.Host)
+	}
+}
+
+// The daemon CLI (status/stop/logs) runs in its own short-lived process and
+// resolves the data dir through this function, while the server resolves it
+// through viper — which reads .env. When the two disagreed, a deployment
+// configured only through .env reported "not running" against a live listener
+// and refused to stop it. DATA_DIR from the OS environment must still win.
+func TestResolveDataDir_PrefersOSEnvOverDotEnv(t *testing.T) {
+	dir := t.TempDir()
+	writeDotEnv(t, dir, "DATA_DIR="+filepath.Join(dir, "from-file")+"\n")
+	t.Chdir(dir)
+	t.Setenv("DATA_DIR", filepath.Join(dir, "from-env"))
+
+	if got := ResolveDataDir(); got != filepath.Join(dir, "from-env") {
+		t.Fatalf("DATA_DIR from the environment must win, got %q", got)
+	}
+}
+
+// The regression itself: no DATA_DIR in the environment at all, which is the
+// shape of every compose deployment that configures the gateway through .env.
+func TestResolveDataDir_FallsBackToDotEnv(t *testing.T) {
+	dir := t.TempDir()
+	fromFile := filepath.Join(dir, "from-file")
+	writeDotEnv(t, dir, "DATA_DIR="+fromFile+"\n")
+	t.Chdir(dir)
+	t.Setenv("DATA_DIR", "")
+
+	if got := ResolveDataDir(); got != fromFile {
+		t.Fatalf("ResolveDataDir() = %q, want the .env value %q", got, fromFile)
+	}
+}
+
+// A .env without DATA_DIR must not be answered with an empty string: the
+// platform default is still the correct answer.
+func TestResolveDataDir_DotEnvWithoutDataDirUsesDefault(t *testing.T) {
+	dir := t.TempDir()
+	writeDotEnv(t, dir, "PORT=20140\n")
+	t.Chdir(dir)
+	t.Setenv("DATA_DIR", "")
+
+	got := ResolveDataDir()
+	if got == "" {
+		t.Fatal("ResolveDataDir() returned empty; want the platform default")
+	}
+	if strings.Contains(got, ".env") {
+		t.Errorf("ResolveDataDir() = %q, want the platform default rather than a config path", got)
+	}
+}
+
+func writeDotEnv(t *testing.T, dir, content string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte(content), 0600); err != nil {
+		t.Fatalf("write .env: %v", err)
+	}
+}
+
+func TestProvideConfig(t *testing.T) {
+	v := ProvideViper()
+	cfg := ProvideConfig(v)
+	if cfg == nil {
+		t.Fatal("expected ProvideConfig to return non-nil Config")
+	}
+	if cfg.Port != 20130 {
+		t.Errorf("expected default port 20130, got %d", cfg.Port)
+	}
+}
+
+func TestLoadConfig_DBPathDirResolution(t *testing.T) {
+	tempDir := t.TempDir()
+	// Test case 1: DB_PATH directory with db/data.sqlite
+	dbDir0 := filepath.Join(tempDir, "db0")
+	_ = os.MkdirAll(filepath.Join(dbDir0, "db"), 0755)
+	_ = os.WriteFile(filepath.Join(dbDir0, "db", "data.sqlite"), []byte(""), 0600)
+	t.Setenv("DB_PATH", dbDir0)
+	cfg0 := LoadConfig()
+	if cfg0.DatabasePath != filepath.Join(dbDir0, "db", "data.sqlite") {
+		t.Errorf("expected db/data.sqlite resolution, got %s", cfg0.DatabasePath)
+	}
+
+	// Test case 2: DB_PATH directory with data.sqlite
+	dbDir1 := filepath.Join(tempDir, "db1")
+	_ = os.MkdirAll(dbDir1, 0755)
+	_ = os.WriteFile(filepath.Join(dbDir1, "data.sqlite"), []byte(""), 0600)
+	t.Setenv("DB_PATH", dbDir1)
+	cfg1 := LoadConfig()
+	if cfg1.DatabasePath != filepath.Join(dbDir1, "data.sqlite") {
+		t.Errorf("expected data.sqlite resolution, got %s", cfg1.DatabasePath)
+	}
+
+	// Test case 3: DB_PATH directory with 9router.db
+	dbDir2 := filepath.Join(tempDir, "db2")
+	_ = os.MkdirAll(dbDir2, 0755)
+	_ = os.WriteFile(filepath.Join(dbDir2, "9router.db"), []byte(""), 0600)
+	t.Setenv("DB_PATH", dbDir2)
+	cfg2 := LoadConfig()
+	if cfg2.DatabasePath != filepath.Join(dbDir2, "9router.db") {
+		t.Errorf("expected 9router.db resolution, got %s", cfg2.DatabasePath)
+	}
+
+	// Test case 4: DB_PATH directory without known files falls back to db/data.sqlite
+	dbDir3 := filepath.Join(tempDir, "db3")
+	_ = os.MkdirAll(dbDir3, 0755)
+	t.Setenv("DB_PATH", dbDir3)
+	cfg3 := LoadConfig()
+	if cfg3.DatabasePath != filepath.Join(dbDir3, "db", "data.sqlite") {
+		t.Errorf("expected default db/data.sqlite fallback, got %s", cfg3.DatabasePath)
+	}
+}
+
+func TestLoadJWTSecret_PersistAndRead(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv("DATA_DIR", dataDir)
+	t.Setenv("JWT_SECRET", "")
+
+	// First call should generate and persist secret
+	v := NewViper()
+	cfg1 := LoadConfigFromViper(v)
+	if cfg1.JWTSecret == "" {
+		t.Fatal("expected generated JWT secret")
+	}
+
+	// Second call should read persisted secret
+	cfg2 := LoadConfigFromViper(v)
+	if cfg2.JWTSecret != cfg1.JWTSecret {
+		t.Fatalf("expected persisted JWT secret %q, got %q", cfg1.JWTSecret, cfg2.JWTSecret)
 	}
 }

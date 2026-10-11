@@ -1,15 +1,17 @@
 package dashboard
 
 import (
+	"archive/zip"
+	"bytes"
 	"crypto/subtle"
 	"database/sql"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
-
 	json "encoding/json/v2"
 
 	"golang.org/x/crypto/bcrypt"
@@ -106,6 +108,12 @@ func (h *DashboardHandler) HandleUpdateSettings(w http.ResponseWriter, r *http.R
 		return
 	}
 
+	if h.TokenSaver != nil {
+		if s, err := h.Repo.GetSettings(); err == nil && s != nil {
+			h.TokenSaver.UpdateFromSettings(s)
+		}
+	}
+
 	updated, err := h.Repo.GetSettingsRaw()
 	if err != nil {
 		handlerutil.WriteJSON(w, http.StatusOK, map[string]any{"status": "ok"})
@@ -115,8 +123,20 @@ func (h *DashboardHandler) HandleUpdateSettings(w http.ResponseWriter, r *http.R
 }
 
 // HandleExportDatabase handles GET /api/settings/database (backup download).
+//
+// A dashboard session authorizes this on its own, the same way every other
+// dashboard read does. Demanding the re-typed password header as well meant the
+// download only worked for a caller able to set a custom header, so a plain
+// browser link — or any instance reached through a reverse proxy that strips
+// it — was refused with 401 and the export looked permanently blocked (issue #47).
+// The password header stays as the step-up path for a script that already has it.
+//
+// The payload is shipped as pretty-printed JSON with a download filename, the
+// way upstream answers the profile page's export button, so a saved backup is
+// readable without unzipping it (issue #160). Import still accepts both the JSON
+// download and the older .zip archives.
 func (h *DashboardHandler) HandleExportDatabase(w http.ResponseWriter, r *http.Request) {
-	if !trustedRequest(r) && !h.verifyDashboardPassword(r.Header.Get(passwordHeader)) {
+	if !h.exportAuthorized(r) {
 		writePlainError(w, http.StatusUnauthorized, "Invalid password")
 		return
 	}
@@ -126,7 +146,10 @@ func (h *DashboardHandler) HandleExportDatabase(w http.ResponseWriter, r *http.R
 		writePlainError(w, http.StatusInternalServerError, "Failed to export database")
 		return
 	}
-	handlerutil.WriteJSON(w, http.StatusOK, payload)
+
+	nowStr := time.Now().Format("2006-01-02")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="9router-backup-%s.json"`, nowStr))
+	handlerutil.WriteJSONIndented(w, http.StatusOK, payload)
 }
 
 // HandleImportDatabase handles POST /api/settings/database (backup restore).
@@ -139,9 +162,39 @@ func (h *DashboardHandler) HandleImportDatabase(w http.ResponseWriter, r *http.R
 	defer r.Body.Close()
 
 	var payload map[string]any
-	if err := json.Unmarshal(body, &payload); err != nil || payload == nil {
-		writePlainError(w, http.StatusBadRequest, "Invalid database payload")
-		return
+
+	// Support zip archives (PK\x03\x04 header)
+	if len(body) >= 4 && body[0] == 'P' && body[1] == 'K' && body[2] == 3 && body[3] == 4 {
+		zr, err := zip.NewReader(bytes.NewReader(body), int64(len(body)))
+		if err != nil {
+			writePlainError(w, http.StatusBadRequest, "Invalid zip archive")
+			return
+		}
+		var jsonBytes []byte
+		for _, f := range zr.File {
+			if strings.HasSuffix(strings.ToLower(f.Name), ".json") {
+				rc, err := f.Open()
+				if err != nil {
+					continue
+				}
+				jsonBytes, _ = io.ReadAll(io.LimitReader(rc, 64<<20))
+				rc.Close()
+				break
+			}
+		}
+		if len(jsonBytes) == 0 {
+			writePlainError(w, http.StatusBadRequest, "No json file found inside zip archive")
+			return
+		}
+		if err := json.Unmarshal(jsonBytes, &payload); err != nil || payload == nil {
+			writePlainError(w, http.StatusBadRequest, "Invalid database payload inside zip")
+			return
+		}
+	} else {
+		if err := json.Unmarshal(body, &payload); err != nil || payload == nil {
+			writePlainError(w, http.StatusBadRequest, "Invalid database payload")
+			return
+		}
 	}
 
 	password, _ := payload["password"].(string)
@@ -255,10 +308,14 @@ func (h *DashboardHandler) changeDashboardPassword(currentPassword, newPassword 
 		if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(currentPassword)); err != nil {
 			return errors.New("Invalid current password")
 		}
-	} else if currentPassword != "" && currentPassword != defaultInitialPassword {
-		// No password set yet — only an empty value (or the well-known
-		// default) confirms the first-time set.
-		return errors.New("Invalid current password")
+	} else {
+		initial := config.LoadConfig().InitialPassword
+		if initial == "" {
+			initial = defaultInitialPassword
+		}
+		if currentPassword != "" && currentPassword != initial && currentPassword != defaultInitialPassword {
+			return errors.New("Invalid current password")
+		}
 	}
 
 	hashed, err := bcrypt.GenerateFromPassword([]byte(newPassword), bcrypt.DefaultCost)
@@ -293,6 +350,20 @@ func (h *DashboardHandler) verifyDashboardPassword(password string) bool {
 // presence — so remote callers cannot bypass with an arbitrary value.
 func trustedRequest(r *http.Request) bool {
 	return auth.ValidCLIToken(r.Header.Get(cliTokenHeader))
+}
+
+// exportAuthorized gates the backup download. A dashboard session is enough on
+// its own, matching every other dashboard read; the re-typed password header and
+// the local CLI token remain valid ways in for a caller that is not carrying a
+// session, and an instance with no password set at all has nothing to protect.
+func (h *DashboardHandler) exportAuthorized(r *http.Request) bool {
+	if trustedRequest(r) {
+		return true
+	}
+	if h.verifyDashboardPassword(r.Header.Get(passwordHeader)) {
+		return true
+	}
+	return auth.SessionValid(r) || !auth.RequireLogin(h.Repo)
 }
 
 // sanitizeSettings copies settings and drops secrets, exposing `hasPassword`
@@ -424,8 +495,29 @@ func (h *DashboardHandler) exportDatabase() (*databaseExport, error) {
 		`SELECT id, key, name, machineId, isActive, createdAt FROM apiKeys`); err != nil {
 		return nil, err
 	}
+	// The per-key model allowlist is a separate table, so selecting apiKeys
+	// alone drops it. A restored key would then silently allow every model
+	// again — the one outcome a restriction exists to prevent.
+	access, err := selectRows(db,
+		`SELECT api_key_id, model FROM api_key_model_access ORDER BY api_key_id, model`)
+	if err != nil {
+		return nil, err
+	}
+	allowlists := make(map[string][]string)
+	for _, row := range access {
+		keyID, _ := row["api_key_id"].(string)
+		model, _ := row["model"].(string)
+		if keyID != "" && model != "" {
+			allowlists[keyID] = append(allowlists[keyID], model)
+		}
+	}
 	for _, row := range out.APIKeys {
 		normalizeBool(row, "isActive")
+		if id, _ := row["id"].(string); id != "" {
+			if models := allowlists[id]; len(models) > 0 {
+				row["allowedModels"] = models
+			}
+		}
 	}
 
 	if out.Combos, err = selectRows(db,
@@ -466,6 +558,9 @@ func (h *DashboardHandler) importDatabase(payload map[string]any) error {
 		`DELETE FROM providerNodes`,
 		`DELETE FROM proxyPools`,
 		`DELETE FROM apiKeys`,
+		// Without this the access rows outlive their key and accumulate as
+		// orphans after every import.
+		`DELETE FROM api_key_model_access`,
 		`DELETE FROM combos`,
 		`DELETE FROM kv WHERE scope IN ('modelAliases', 'customModels', 'mitmAlias', 'pricing')`,
 	}
@@ -556,12 +651,29 @@ func (h *DashboardHandler) importDatabase(payload map[string]any) error {
 		if !ok {
 			continue
 		}
+		keyID, _ := k["id"].(string)
+		if keyID == "" {
+			continue
+		}
 		if _, err := tx.Exec(
 			`INSERT OR REPLACE INTO apiKeys(id, key, name, machineId, isActive, createdAt) VALUES(?, ?, ?, ?, ?, ?)`,
 			k["id"], k["key"], stringDefault(k["name"], nil), stringDefault(k["machineId"], nil),
 			boolToInt(k["isActive"]), stringDefault(k["createdAt"], nowISO()),
 		); err != nil {
 			return err
+		}
+		models, _ := k["allowedModels"].([]any)
+		for _, raw := range models {
+			model, _ := raw.(string)
+			if model == "" {
+				continue
+			}
+			if _, err := tx.Exec(
+				`INSERT OR REPLACE INTO api_key_model_access(api_key_id, model) VALUES(?, ?)`,
+				keyID, model,
+			); err != nil {
+				return err
+			}
 		}
 	}
 

@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -163,5 +164,74 @@ func TestProvidersClientProviderSort(t *testing.T) {
 		if m["provider"] != id {
 			t.Errorf("position %d: got %v, want %s", i, m["provider"], id)
 		}
+	}
+}
+
+func TestSanitizeProviderConnection_LastErrorString(t *testing.T) {
+	repo, cleanup := setupTestDB(t)
+	defer cleanup()
+	h := NewDashboardHandler(repo)
+
+	connID := "c-err"
+	if err := repo.CreateProviderConnection(connID, "codex", "oauth", "Codex Err", "secret-codex"); err != nil {
+		t.Fatalf("create connection: %v", err)
+	}
+	if err := repo.LockConnectionRateLimit(connID, time.Now().Add(time.Minute), 1, 429, "Rate limit reached"); err != nil {
+		t.Fatalf("lock rate limit: %v", err)
+	}
+
+	r := setupProvidersClientRouter(h)
+	out := getProvidersClient(t, r, "?provider=codex")
+	conns, _ := out["connections"].([]any)
+	if len(conns) == 0 {
+		t.Fatalf("expected codex connection, got none")
+	}
+	first, _ := conns[0].(map[string]any)
+	lastErr, ok := first["lastError"].(string)
+	if !ok {
+		t.Fatalf("expected lastError to be string, got %T: %v", first["lastError"], first["lastError"])
+	}
+	if lastErr != "Rate limit reached" {
+		t.Errorf("lastError = %q, want %q", lastErr, "Rate limit reached")
+	}
+}
+
+// The registry marks some providers `hidden`: routable, and their detail page
+// stays reachable, but kept out of the lists a person scans. Go keeps no copy
+// of that flag, so this pins the rule the quota lists already imply — a
+// provider the tracker does not serve has nothing to offer there. A provider
+// that ever becomes usage-supported while hidden needs this revisited in the
+// same commit.
+func TestHiddenProvidersStayOutOfTheQuotaList(t *testing.T) {
+	repo, cleanup := setupTestDB(t)
+	defer cleanup()
+	h := NewDashboardHandler(repo)
+
+	for _, s := range []struct{ id, provider, authType string }{
+		{"c-claude", "claude", "oauth"},
+		{"c-deepseek", "deepseek", "apikey"},
+		// mmf/mimo-free is the registry's one hidden chat provider; the other
+		// four hidden entries are TTS-only.
+		{"c-mmf", "mmf", "apikey"},
+	} {
+		if err := repo.CreateProviderConnection(s.id, s.provider, s.authType, s.id, "sk-"+s.provider); err != nil {
+			t.Fatalf("seed %s: %v", s.provider, err)
+		}
+	}
+
+	out := getProvidersClient(t, setupProvidersClientRouter(h), "")
+	rawOpts, _ := out["providerOptions"].([]any)
+	opts := make([]string, 0, len(rawOpts))
+	for _, o := range rawOpts {
+		s, _ := o.(string)
+		opts = append(opts, s)
+	}
+	for _, p := range opts {
+		if p == "mmf" {
+			t.Errorf("hidden provider mmf reached the quota provider list: %v", opts)
+		}
+	}
+	if len(opts) != 2 {
+		t.Errorf("providerOptions = %v, want the two visible providers only", opts)
 	}
 }

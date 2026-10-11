@@ -25,12 +25,23 @@ func cleanGeminiSchema(schema map[string]any) {
 		"default", "examples",
 		"$schema", "$defs", "definitions", "const", "$ref", "$comment",
 		"deprecated", "readOnly", "writeOnly",
-		"additionalProperties", "propertyNames", "patternProperties", "enumDescriptions",
+		// additionalItems (draft-07 tuple tail) is rejected like prefixItems:
+		// `Unknown name "additionalItems" at functionDeclaration.parameters` 400.
+		// Listed here, not deleted locally, so the strip re-runs on keys an
+		// anyOf/oneOf branch merges back in.
+		"additionalItems", "additionalProperties", "propertyNames", "patternProperties", "enumDescriptions",
 		"allOf", "not",
 		"dependencies", "dependentSchemas", "dependentRequired",
 		"title", "optional", "if", "then", "else", "contentMediaType", "contentEncoding",
 		"cornerRadius", "fillColor", "fontFamily", "fontSize", "fontWeight",
 		"gap", "padding", "strokeColor", "strokeThickness", "textColor",
+		// Non-standard annotation/error keywords some MCP tool schemas emit
+		// (upstream #4283). Gemini's schema proto has no field for these and
+		// rejects the whole request with "Unknown name X: Cannot find field"
+		// if any nested node carries one. Bare names: the x- rule below only
+		// catches the vendor-prefixed spellings.
+		"errorMessage", "errorMessages", "markdownDescription",
+		"doNotSuggest", "suggestSortText", "minProperties", "maxProperties",
 	}
 
 	// stripUnsupported removes keywords Gemini rejects. Called again after anyOf/oneOf

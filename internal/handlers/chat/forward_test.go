@@ -63,7 +63,7 @@ func TestForwardRequest_BearerAuth(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	body := []byte(`{"model":"x","messages":[{"role":"user","content":"hi"}]}`)
-	err := h.forwardRequest(context.Background(), rec, cfg, "sk-secret", body, false, false, nil)
+	err := h.forwardRequest(context.Background(), rec, cfg, "sk-secret", body, false, false, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -91,7 +91,7 @@ func TestForwardRequest_RawAuth(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	body := []byte(`{"model":"x","messages":[]}`)
-	err := h.forwardRequest(context.Background(), rec, cfg, "raw-key", body, false, false, nil)
+	err := h.forwardRequest(context.Background(), rec, cfg, "raw-key", body, false, false, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -115,7 +115,7 @@ func TestForwardRequest_DefaultAuthWhenUnknownScheme(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	err := h.forwardRequest(context.Background(), rec, cfg, "k", []byte(`{}`), false, false, nil)
+	err := h.forwardRequest(context.Background(), rec, cfg, "k", []byte(`{}`), false, false, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -139,7 +139,7 @@ func TestForwardRequest_NoAuth(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	err := h.forwardRequest(context.Background(), rec, cfg, "should-not-be-sent", []byte(`{}`), false, false, nil)
+	err := h.forwardRequest(context.Background(), rec, cfg, "should-not-be-sent", []byte(`{}`), false, false, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -162,7 +162,7 @@ func TestForwardRequest_StaticHeadersApplied(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	err := h.forwardRequest(context.Background(), rec, cfg, "k", []byte(`{}`), false, false, nil)
+	err := h.forwardRequest(context.Background(), rec, cfg, "k", []byte(`{}`), false, false, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -188,7 +188,7 @@ func TestForwardRequest_UpstreamError(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	err := h.forwardRequest(context.Background(), rec, cfg, "k", []byte(`{}`), false, false, nil)
+	err := h.forwardRequest(context.Background(), rec, cfg, "k", []byte(`{}`), false, false, nil, nil)
 	if err == nil {
 		t.Fatal("expected upstream error")
 	}
@@ -208,7 +208,7 @@ func TestHandleJSONResponse_NonTranslate(t *testing.T) {
 	h, cleanup := setupHandlerForForward(t)
 	defer cleanup()
 
-	upstream := strings.NewReader(`{"id":"x"}`)
+	upstream := strings.NewReader(`{"id":"x","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}`)
 	rec := httptest.NewRecorder()
 	if err := h.handleJSONResponse(context.Background(), rec, upstream, false, nil); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -216,7 +216,7 @@ func TestHandleJSONResponse_NonTranslate(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Errorf("expected 200, got %d", rec.Code)
 	}
-	if rec.Body.String() != `{"id":"x"}` {
+	if rec.Body.String() != `{"id":"x","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}` {
 		t.Errorf("expected passthrough body, got %s", rec.Body.String())
 	}
 }
@@ -304,7 +304,7 @@ func TestForwardRequest_StreamSetsAcceptHeader(t *testing.T) {
 	body, _ := json.Marshal(map[string]any{"model": "x", "messages": []any{}})
 	ctx := translator.WithUsageCapture(context.Background())
 	rec := httptest.NewRecorder()
-	err := h.forwardRequest(ctx, rec, cfg, "k", body, true, false, &streamMetrics{})
+	err := h.forwardRequest(ctx, rec, cfg, "k", body, true, false, &streamMetrics{}, nil)
 	if err != nil {
 		t.Fatalf("stream request: %v", err)
 	}

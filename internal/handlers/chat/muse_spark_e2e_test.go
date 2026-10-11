@@ -2,7 +2,6 @@ package chat
 
 import (
 	"bytes"
-	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -11,7 +10,14 @@ import (
 	"9router/proxy/internal/proxy/executor"
 )
 
+// Every test in this file reaches the real opencode free tier over the network —
+// setupChatTestDB seeds no opencode connection, so the model resolves straight
+// to the provider. See live_guard_test.go for the opt-in, and run them with
+// make test-live. (opencode_mock_e2e_test.go is the offline counterpart: it seeds
+// its own conn-oc-* rows pointing at a local fake server.)
+
 func TestIntegration_OpenCode_MuseSpark_Messages(t *testing.T) {
+	requireLiveUpstream(t)
 	executor.RegisterAll()
 	database, cleanup := setupChatTestDB(t)
 	defer cleanup()
@@ -52,19 +58,16 @@ func TestIntegration_OpenCode_MuseSpark_Messages(t *testing.T) {
 	t.Logf("Response Code: %d", rec.Code)
 	t.Logf("Response Body: %s", rec.Body.String())
 
-	if rec.Code == http.StatusTooManyRequests || rec.Code == http.StatusForbidden {
-		t.Skipf("opencode free tier rate limited (429/403), skipping real upstream test: %s", rec.Body.String())
-	}
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected HTTP 200, got %d: %s", rec.Code, rec.Body.String())
-	}
+	requireLiveOK(t, rec.Code, rec.Body.String())
 	bodyStr := rec.Body.String()
 	if !strings.Contains(bodyStr, "event: message_start") || (!strings.Contains(bodyStr, "event: content_block_delta") && !strings.Contains(bodyStr, "event: message_delta")) {
 		t.Fatalf("expected Claude SSE format (message_start / message_delta), got: %s", bodyStr)
 	}
 }
 
+
 func TestIntegration_OpenCode_MuseSpark_Messages_NonStreaming(t *testing.T) {
+	requireLiveUpstream(t)
 	executor.RegisterAll()
 	database, cleanup := setupChatTestDB(t)
 	defer cleanup()
@@ -92,12 +95,7 @@ func TestIntegration_OpenCode_MuseSpark_Messages_NonStreaming(t *testing.T) {
 	t.Logf("Non-streaming Response Code: %d", rec.Code)
 	t.Logf("Non-streaming Response Body: %s", rec.Body.String())
 
-	if rec.Code == http.StatusTooManyRequests || rec.Code == http.StatusForbidden {
-		t.Skipf("opencode rate limited 429/403, skipping: %s", rec.Body.String())
-	}
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected HTTP 200, got %d: %s", rec.Code, rec.Body.String())
-	}
+	requireLiveOK(t, rec.Code, rec.Body.String())
 	contentType := rec.Header().Get("Content-Type")
 	if !strings.Contains(contentType, "application/json") {
 		t.Fatalf("expected application/json content type, got: %s", contentType)
@@ -109,6 +107,7 @@ func TestIntegration_OpenCode_MuseSpark_Messages_NonStreaming(t *testing.T) {
 }
 
 func TestIntegration_OpenCode_MuseSpark_ChatCompletions(t *testing.T) {
+	requireLiveUpstream(t)
 	executor.RegisterAll()
 	database, cleanup := setupChatTestDB(t)
 	defer cleanup()
@@ -152,15 +151,11 @@ func TestIntegration_OpenCode_MuseSpark_ChatCompletions(t *testing.T) {
 	t.Logf("Response Code: %d", rec.Code)
 	t.Logf("Response Body: %s", rec.Body.String())
 
-	if rec.Code == http.StatusTooManyRequests || rec.Code == http.StatusForbidden {
-		t.Skipf("opencode rate limited 429/403, skipping: %s", rec.Body.String())
-	}
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected HTTP 200, got %d: %s", rec.Code, rec.Body.String())
-	}
+	requireLiveOK(t, rec.Code, rec.Body.String())
 }
 
 func TestIntegration_OpenCode_MuseSpark_MultiTurnWithTools(t *testing.T) {
+	requireLiveUpstream(t)
 	executor.RegisterAll()
 	database, cleanup := setupChatTestDB(t)
 	defer cleanup()
@@ -223,15 +218,11 @@ func TestIntegration_OpenCode_MuseSpark_MultiTurnWithTools(t *testing.T) {
 	t.Logf("Response Code: %d", rec.Code)
 	t.Logf("Response Body: %s", rec.Body.String())
 
-	if rec.Code == http.StatusTooManyRequests || rec.Code == http.StatusForbidden {
-		t.Skipf("opencode rate limited 429/403, skipping: %s", rec.Body.String())
-	}
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected HTTP 200, got %d: %s", rec.Code, rec.Body.String())
-	}
+	requireLiveOK(t, rec.Code, rec.Body.String())
 }
 
 func TestIntegration_OpenCode_MuseSpark13_ChatCompletions(t *testing.T) {
+	requireLiveUpstream(t)
 	executor.RegisterAll()
 	database, cleanup := setupChatTestDB(t)
 	defer cleanup()
@@ -256,59 +247,9 @@ func TestIntegration_OpenCode_MuseSpark13_ChatCompletions(t *testing.T) {
 	t.Logf("1.3 Response Code: %d", rec.Code)
 	t.Logf("1.3 Response Body: %s", rec.Body.String())
 
-	if rec.Code == http.StatusTooManyRequests {
-		t.Skipf("opencode rate limited 429, skipping: %s", rec.Body.String())
-	}
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected HTTP 200 for muse-spark-1.3, got %d: %s", rec.Code, rec.Body.String())
-	}
+	requireLiveOK(t, rec.Code, rec.Body.String())
 	if strings.Contains(rec.Body.String(), "FreeTierError") {
 		t.Fatalf("unexpected FreeTierError: %s", rec.Body.String())
 	}
 }
 
-func TestIntegration_OpenCode_UnionAlpha_Messages(t *testing.T) {
-	executor.RegisterAll()
-	database, cleanup := setupChatTestDB(t)
-	defer cleanup()
-
-	repo := db.NewRepo(database)
-	handler := NewChatHandler(repo)
-
-	// union-alpha is served by https://opencode.ai/zen/v1/messages (Anthropic Messages
-	// format, PR #4099). Free public endpoint — skip on upstream rate limits/nets.
-	claudeBody := `{
-		"model": "oc/union-alpha",
-		"messages": [
-			{"role": "user", "content": "Reply with exactly one short word."}
-		],
-		"max_tokens": 1024,
-		"stream": true
-	}`
-
-	req := httptest.NewRequest("POST", "/v1/messages", bytes.NewReader([]byte(claudeBody)))
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-
-	handler.HandleMessages(rec, req)
-
-	t.Logf("union-alpha Response Code: %d", rec.Code)
-	if rec.Code == http.StatusTooManyRequests || rec.Code == http.StatusBadGateway || rec.Code == http.StatusServiceUnavailable {
-		t.Skipf("union-alpha free tier rate limited/unavailable (%d), skipping real upstream test: %s", rec.Code, rec.Body.String())
-	}
-	// union-alpha is served only to authenticated OpenCode desktop sessions; an anonymous
-	// public call gets ModelError "Model union-alpha is not supported" (401). Routing to
-	// /zen/v1/messages is already proven by the Anthropic-format error envelope.
-	if rec.Code == http.StatusUnauthorized && strings.Contains(rec.Body.String(), "not supported") {
-		t.Skipf("union-alpha requires an authenticated OpenCode session, skipping: %s", rec.Body.String())
-	}
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected HTTP 200 for union-alpha, got %d: %s", rec.Code, rec.Body.String())
-	}
-	bodyStr := rec.Body.String()
-	if !strings.Contains(bodyStr, "event: message_start") || (!strings.Contains(bodyStr, "event: content_block_delta") && !strings.Contains(bodyStr, "event: message_delta")) {
-
-		t.Fatalf("expected Claude SSE format (message_start / content_block_delta), got: %s", bodyStr)
-
-	}
-}

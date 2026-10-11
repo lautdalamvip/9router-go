@@ -1,8 +1,78 @@
 package dashboard
 
 import (
+	json "encoding/json/v2"
+	"net/http"
+	"strings"
 	"testing"
 )
+
+// TestAutoFamilyCombosEndpoint exercises the real route: with an active
+// gemini connection the registry's flash models must collapse into one
+// editable auto-family combo, and regenerating must upsert instead of stack.
+func TestAutoFamilyCombosEndpoint(t *testing.T) {
+	repo, cleanup := setupTestDB(t)
+	defer cleanup()
+	router := setupTestRouter(repo)
+
+	seedConnection(t, repo.RawDB(), "gemini")
+
+	rec := postJSON(t, router, "/api/combos/auto-family", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("auto-family expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var res map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	created, _ := res["created"].([]any)
+	hasFlash := false
+	for _, f := range created {
+		if f == "gemini-flash" {
+			hasFlash = true
+		}
+	}
+	if !hasFlash {
+		t.Fatalf("expected a gemini-flash family among %v", created)
+	}
+
+	combo, err := repo.GetComboById(autoFamilyComboID("gemini-flash"))
+	if err != nil {
+		t.Fatalf("GetComboById: %v", err)
+	}
+	if combo == nil {
+		t.Fatal("expected auto-family-gemini-flash combo row to exist")
+	}
+	if combo.Kind == nil || *combo.Kind != autoFamilyComboKind {
+		t.Fatalf("kind = %v, want %q", combo.Kind, autoFamilyComboKind)
+	}
+	members, err := comboModels(combo.Models)
+	if err != nil {
+		t.Fatalf("comboModels: %v", err)
+	}
+	if len(members) < 2 {
+		t.Fatalf("expected at least 2 members, got %v", members)
+	}
+	for _, m := range members {
+		if !strings.HasPrefix(m, "gmni/") && !strings.Contains(m, "gemini") {
+			t.Errorf("member %q does not belong to the gemini catalog", m)
+		}
+	}
+
+	// Regenerating upserts: same count, no duplicate rows.
+	firstCount, _ := res["count"].(float64)
+	rec = postJSON(t, router, "/api/combos/auto-family", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("second auto-family expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var res2 map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &res2); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if res2["count"] != res["count"] {
+		t.Errorf("regeneration changed family count: %v -> %v", firstCount, res2["count"])
+	}
+}
 
 func TestModelFamily(t *testing.T) {
 	tests := []struct {

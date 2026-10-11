@@ -11,6 +11,53 @@ import (
 	"9router/proxy/internal/translator"
 )
 
+// encoding/json/v2 rejects a repeated member name and invalid UTF-8, so a
+// chunk carrying one is skipped by parseChatChunk and its content delta never
+// reaches the client. v1 accepted both; the option set restores that.
+func TestParseChatChunk_LenientAboutProviderChunks(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+		want    string
+	}{
+		{
+			name:    "repeated member name",
+			payload: `{"id":"c1","id":"c2","choices":[{"index":0,"delta":{"content":"hi"}}]}`,
+			want:    "hi",
+		},
+		{
+			name:    "invalid utf-8 in the delta",
+			payload: "{\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"caf\xc3\xa9 \xff\"}}]}",
+			want:    "caf\u00e9 \ufffd",
+		},
+		{
+			name:    "unpaired surrogate escape",
+			payload: `{"id":"c1","choices":[{"index":0,"delta":{"content":"ok \ud83d"}}]}`,
+			want:    "ok \ufffd",
+		},
+		{
+			name:    "member key spelled with different casing",
+			payload: `{"Id":"c1","Choices":[{"Index":0,"Delta":{"Content":"hi"}}]}`,
+			want:    "hi",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			chunk := parseChatChunk([]byte(tt.payload))
+			if chunk == nil {
+				t.Fatalf("parseChatChunk(%s) = nil, want a chunk: the provider sent an answer", tt.payload)
+			}
+			if len(chunk.Choices) != 1 {
+				t.Fatalf("parseChatChunk(%s) produced %d choices, want 1", tt.payload, len(chunk.Choices))
+			}
+			if got := chunk.Choices[0].Delta.Content; got != tt.want {
+				t.Errorf("delta content = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 const chatStreamWithAnswer = "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hel\"}}]}\n\n" +
 	"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"}}]}\n\n" +
 	"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}\n\n" +
@@ -78,9 +125,13 @@ func TestUpstreamSpeaksResponses(t *testing.T) {
 		{"openai is a chat endpoint", "openai", "gpt-5.1", &providers.ProviderConfig{BaseURL: "https://api.openai.com/v1/chat/completions"}, false},
 		{"muse-spark leaves the chat endpoint for opencode", "opencode", "muse-spark-1.3-contributor", &providers.ProviderConfig{BaseURL: "https://opencode.ai/zen/v1/chat/completions"}, true},
 		{"gpt-5.6-luna leaves the chat endpoint for opencode-go", "opencode-go", "gpt-5.6-luna", &providers.ProviderConfig{BaseURL: "https://opencode.ai/zen/go/v1/chat/completions"}, true},
-		{"other opencode models stay on chat", "opencode", "gpt-5.4", &providers.ProviderConfig{BaseURL: "https://opencode.ai/zen/v1/chat/completions"}, false},
+		{"gpt-5.4 answers the gpt family from responses upstream", "opencode", "gpt-5.4", &providers.ProviderConfig{BaseURL: "https://opencode.ai/zen/v1/chat/completions"}, true},
 		{"a model name alone never implies responses", "openai", "muse-spark-1.3-contributor", &providers.ProviderConfig{BaseURL: "https://api.openai.com/v1/chat/completions"}, false},
 		{"missing config cannot be native", "codex", "gpt-5.1", nil, false},
+		{"muse spark is responses-native on zen", "opencode-zen", "muse-spark-1.3", &providers.ProviderConfig{BaseURL: "https://opencode.ai/zen/v1/chat/completions"}, true},
+		{"gpt family is responses-native on zen", "opencode-zen", "gpt-5.4", &providers.ProviderConfig{BaseURL: "https://opencode.ai/zen/v1/chat/completions"}, true},
+		{"zen chat-lane models are translated in, not relayed", "opencode-zen", "deepseek-v4-pro", &providers.ProviderConfig{BaseURL: "https://opencode.ai/zen/v1/chat/completions"}, false},
+		{"zen messages-lane models are translated in, not relayed", "opencode-zen", "claude-sonnet-4-6", &providers.ProviderConfig{BaseURL: "https://opencode.ai/zen/v1/chat/completions"}, false},
 	}
 
 	for _, tt := range tests {
@@ -117,4 +168,53 @@ func TestHandleClaudeMessagesStream_ResponsesClient(t *testing.T) {
 	if !strings.Contains(out, "event: response.completed") {
 		t.Errorf("two-hop stream never emitted response.completed:\n%s", out)
 	}
+}
+
+// A /v1/messages client on a Claude upstream still needs fitted tool names
+// restored. The TranslateResp branch is a passthrough — no OpenAI translation
+// happens — but the request was fitted before it left, so skipping the
+// decloaker there forwarded the 64-char name and left the client unable to
+// dispatch the call.
+func TestHandleClaudeMessages_TranslateRespRestoresToolNames(t *testing.T) {
+	const longName = "mcp__server_name__action_detail_something_very_long_indeed_action_12345"
+	const shortName = "mcp__server_name__action_detail_something_very_long_indeed_act_1"
+toolMap := map[string]string{shortName: longName}
+
+	t.Run("stream passthrough", func(t *testing.T) {
+		upstream := strings.Join([]string{
+			"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"" + shortName + "\"}}\n\n",
+			"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+		}, "")
+
+		rec := httptest.NewRecorder()
+		req := &Request{Ctx: context.Background(), IsStream: true, TranslateResp: true, ToolNameMap: toolMap}
+
+		if err := handleClaudeMessagesStream(rec, req, strings.NewReader(upstream)); err != nil {
+			t.Fatalf("handleClaudeMessagesStream: %v", err)
+		}
+		out := rec.Body.String()
+		if strings.Contains(out, shortName) {
+			t.Errorf("the fitted name reached the client undecloaked:\n%s", out)
+		}
+		if !strings.Contains(out, longName) {
+			t.Errorf("expected the caller's name %q restored:\n%s", longName, out)
+		}
+	})
+
+	t.Run("non-stream passthrough", func(t *testing.T) {
+		body := `{"content":[{"type":"tool_use","id":"toolu_1","name":"` + shortName + `","input":{}}]}`
+		rec := httptest.NewRecorder()
+		req := &Request{Ctx: context.Background(), TranslateResp: true, ToolNameMap: toolMap}
+
+		if err := handleClaudeMessagesNonStream(rec, req, strings.NewReader(body)); err != nil {
+			t.Fatalf("handleClaudeMessagesNonStream: %v", err)
+		}
+		out := rec.Body.String()
+		if strings.Contains(out, shortName) {
+			t.Errorf("the fitted name reached the client undecloaked:\n%s", out)
+		}
+		if !strings.Contains(out, longName) {
+			t.Errorf("expected the caller's name %q restored:\n%s", longName, out)
+		}
+	})
 }

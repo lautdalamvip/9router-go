@@ -29,6 +29,8 @@ export const PROVIDER_ID_TO_ALIAS: Record<string, string> = {
   "assemblyai": "aai",
   "aws-polly": "aws-polly",
   "azure": "azure",
+  "bedrock": "br",
+  "bedrock-xai": "brx",
   "baidu": "qianfan",
   "bazaarlink": "bzl",
   "black-forest-labs": "bfl",
@@ -82,8 +84,12 @@ export const PROVIDER_ID_TO_ALIAS: Record<string, string> = {
   "mimo-free": "mmf",
   "minimax": "minimax",
   "minimax-cn": "minimax-cn",
+  "minimax-code": "mmc",
+  "minimax-code-global": "mmg",
   "mistral": "mistral",
   "mmf": "mmf",
+  "muse": "muse",
+  "tinyfish": "tinyfish",
   "morph": "morph",
   "nanobanana": "nb",
   "nebius": "nebius",
@@ -121,6 +127,7 @@ export const PROVIDER_ID_TO_ALIAS: Record<string, string> = {
   "vertex": "vx",
   "vertex-partner": "vxp",
   "volcengine-ark": "ark",
+  "v1m": "v1m",
   "voyage-ai": "voyage",
   "windsurf": "windsurf",
   "xai": "xai",
@@ -169,6 +176,62 @@ const FREEBUFF_MODELS: ProviderModel[] = [
 
 export const BUILTIN_MODELS_BY_PROVIDER: Record<string, ProviderModel[]> = {
   "fb": FREEBUFF_MODELS,
+  "br": [
+    {
+      "id": "us.anthropic.claude-opus-5",
+      "name": "Claude Opus 5"
+    },
+    {
+      "id": "us.anthropic.claude-sonnet-5",
+      "name": "Claude Sonnet 5"
+    },
+    {
+      "id": "us.anthropic.claude-fable-5",
+      "name": "Claude Fable 5"
+    },
+    {
+      "id": "us.anthropic.claude-opus-4-8",
+      "name": "Claude Opus 4.8"
+    },
+    {
+      "id": "us.anthropic.claude-opus-4-7",
+      "name": "Claude Opus 4.7"
+    },
+    {
+      "id": "us.anthropic.claude-sonnet-4-6",
+      "name": "Claude Sonnet 4.6"
+    },
+    {
+      "id": "us.anthropic.claude-opus-4-5-20251101-v1:0",
+      "name": "Claude Opus 4.5"
+    },
+    {
+      "id": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+      "name": "Claude Sonnet 4.5"
+    },
+    {
+      "id": "us.anthropic.claude-opus-4-1-20250805-v1:0",
+      "name": "Claude Opus 4.1"
+    },
+    {
+      "id": "us.anthropic.claude-sonnet-4-20250514-v1:0",
+      "name": "Claude Sonnet 4"
+    },
+    {
+      "id": "us.anthropic.claude-3-haiku-20240307-v1:0",
+      "name": "Claude 3 Haiku"
+    }
+  ],
+  "brx": [
+    {
+      "id": "us.xai.grok-4.6",
+      "name": "Grok 4.6"
+    },
+    {
+      "id": "global.xai.grok-4.6",
+      "name": "Grok 4.6 (global)"
+    }
+  ],
   "freebuff": FREEBUFF_MODELS,
   "alicode-intl": [
     {
@@ -328,20 +391,8 @@ export const BUILTIN_MODELS_BY_PROVIDER: Record<string, ProviderModel[]> = {
       "upstreamModelId": "gemini-3.6-flash-tiered(low)"
     },
     {
-      "id": "gemini-3.5-flash-high",
-      "name": "Gemini 3.5 Flash (High)"
-    },
-    {
-      "id": "gemini-3-flash-agent",
-      "name": "Gemini 3.5 Flash (High)"
-    },
-    {
-      "id": "gemini-3.5-flash-low",
-      "name": "Gemini 3.5 Flash (Medium)"
-    },
-    {
-      "id": "gemini-3.5-flash-extra-low",
-      "name": "Gemini 3.5 Flash (Low)"
+      "id": "gemini-3.1-pro-high",
+      "name": "Gemini 3.1 Pro (High)"
     },
     {
       "id": "gemini-pro-agent",
@@ -350,6 +401,46 @@ export const BUILTIN_MODELS_BY_PROVIDER: Record<string, ProviderModel[]> = {
     {
       "id": "gemini-3.1-pro-low",
       "name": "Gemini 3.1 Pro (Low)"
+    },
+    {
+      "id": "claude-sonnet-5-5-high",
+      "name": "Claude Sonnet 5.5 (High)",
+      "upstreamModelId": "claude-sonnet-5-5-high(high)"
+    },
+    {
+      "id": "claude-sonnet-5-5-medium",
+      "name": "Claude Sonnet 5.5 (Medium)",
+      "upstreamModelId": "claude-sonnet-5-5-medium(medium)"
+    },
+    {
+      "id": "claude-sonnet-5-5-low",
+      "name": "Claude Sonnet 5.5 (Low)",
+      "upstreamModelId": "claude-sonnet-5-5-low(low)"
+    },
+    {
+      "id": "claude-sonnet-5-5",
+      "name": "Claude Sonnet 5.5 (Thinking)",
+      "upstreamModelId": "claude-sonnet-5-5-high(high)"
+    },
+    {
+      "id": "claude-opus-5-5-high",
+      "name": "Claude Opus 5.5 (High)",
+      "upstreamModelId": "claude-opus-5-5-high(high)"
+    },
+    {
+      "id": "claude-opus-5-5-medium",
+      "name": "Claude Opus 5.5 (Medium)",
+      "upstreamModelId": "claude-opus-5-5-medium(medium)"
+    },
+    {
+      "id": "claude-opus-5-5-low",
+      "name": "Claude Opus 5.5 (Low)",
+      "upstreamModelId": "claude-opus-5-5-low(low)"
+    },
+    {
+      "id": "claude-opus-5-5",
+      "name": "Claude Opus 5.5 (Thinking)",
+      "upstreamModelId": "claude-opus-5-5-high(high)"
     },
     {
       "id": "claude-sonnet-4-6",
@@ -362,11 +453,6 @@ export const BUILTIN_MODELS_BY_PROVIDER: Record<string, ProviderModel[]> = {
     {
       "id": "gpt-oss-120b-medium",
       "name": "GPT-OSS 120B (Medium)"
-    },
-    {
-      "id": "gemini-3-flash",
-      "name": "Gemini 3 Flash",
-      "thinking": false
     },
     {
       "id": "gemini-3.1-flash-image",
@@ -711,6 +797,11 @@ export const BUILTIN_MODELS_BY_PROVIDER: Record<string, ProviderModel[]> = {
   ],
   "cloudflare-ai": [
     {
+      "id": "@cf/cloudflare/clef-flash",
+      "name": "Clef Flash",
+      "kind": "systemone"
+    },
+    {
       "id": "@cf/meta/llama-3.2-1b-instruct",
       "name": "Llama 3.2 1B Instruct"
     },
@@ -914,44 +1005,78 @@ export const BUILTIN_MODELS_BY_PROVIDER: Record<string, ProviderModel[]> = {
   ],
   "cx": [
     {
+      "id": "gpt-6.1-sol",
+      "name": "GPT 6.1 Sol",
+      "upstreamModelId": "gpt-6.1-sol"
+    },
+    {
       "id": "gpt-6-astra",
       "name": "GPT 6.0 Astra"
+    },
+    {
+      "id": "gpt-6-astra[1m]",
+      "name": "GPT 6.0 Astra (extended context)",
+      "upstreamModelId": "gpt-6-astra"
     },
     {
       "id": "gpt-6-sol",
-      "name": "GPT-6 Sol"
+      "name": "GPT 6.0 Sol"
+    },
+    {
+      "id": "gpt-6-sol[1m]",
+      "name": "GPT 6.0 Sol (extended context)",
+      "upstreamModelId": "gpt-6-sol"
     },
     {
       "id": "gpt-6-luna",
-      "name": "GPT-6 Luna"
+      "name": "GPT 6.0 Luna"
     },
     {
-      "id": "gpt-6-astra",
-      "name": "GPT 6.0 Astra"
+      "id": "gpt-6-luna[1m]",
+      "name": "GPT 6.0 Luna (extended context)",
+      "upstreamModelId": "gpt-6-luna"
     },
     {
       "id": "gpt-5.6-sol",
       "name": "GPT 5.6 Sol"
     },
     {
+      "id": "gpt-5.6-sol[1m]",
+      "name": "GPT 5.6 Sol (extended context)",
+      "upstreamModelId": "gpt-5.6-sol"
+    },
+    {
       "id": "gpt-5.6-sol-review",
-      "name": "GPT 5.6 Sol Review"
+      "name": "GPT 5.6 Sol Review",
+      "upstreamModelId": "gpt-5.6-sol"
     },
     {
       "id": "gpt-5.6-terra",
       "name": "GPT 5.6 Terra"
     },
     {
+      "id": "gpt-5.6-terra[1m]",
+      "name": "GPT 5.6 Terra (extended context)",
+      "upstreamModelId": "gpt-5.6-terra"
+    },
+    {
       "id": "gpt-5.6-terra-review",
-      "name": "GPT 5.6 Terra Review"
+      "name": "GPT 5.6 Terra Review",
+      "upstreamModelId": "gpt-5.6-terra"
     },
     {
       "id": "gpt-5.6-luna",
       "name": "GPT 5.6 Luna"
     },
     {
+      "id": "gpt-5.6-luna[1m]",
+      "name": "GPT 5.6 Luna (extended context)",
+      "upstreamModelId": "gpt-5.6-luna"
+    },
+    {
       "id": "gpt-5.6-luna-review",
-      "name": "GPT 5.6 Luna Review"
+      "name": "GPT 5.6 Luna Review",
+      "upstreamModelId": "gpt-5.6-luna"
     },
     {
       "id": "gpt-5.5",
@@ -959,31 +1084,21 @@ export const BUILTIN_MODELS_BY_PROVIDER: Record<string, ProviderModel[]> = {
     },
     {
       "id": "gpt-5.5-review",
-      "name": "GPT 5.5 Review"
+      "name": "GPT 5.5 Review",
+      "upstreamModelId": "gpt-5.5"
     },
     {
-      "id": "gpt-5.4",
-      "name": "GPT 5.4"
+      "id": "gpt-daybreak-blue-latest",
+      "name": "GPT Daybreak Blue"
     },
     {
-      "id": "gpt-5.4-review",
-      "name": "GPT 5.4 Review"
+      "id": "gpt-reserve",
+      "name": "GPT Reserve"
     },
     {
-      "id": "gpt-5.4-mini",
-      "name": "GPT 5.4 Mini"
-    },
-    {
-      "id": "gpt-5.4-mini-review",
-      "name": "GPT 5.4 Mini Review"
-    },
-    {
-      "id": "gpt-5.3-codex-spark",
-      "name": "GPT 5.3 Codex Spark"
-    },
-    {
-      "id": "gpt-5.3-codex-spark-review",
-      "name": "GPT 5.3 Codex Spark Review"
+      "id": "codex-auto-review",
+      "name": "Codex Auto Review",
+      "upstreamModelId": "codex-auto-review"
     },
     {
       "id": "gpt-image-2.5",
@@ -1020,10 +1135,6 @@ export const BUILTIN_MODELS_BY_PROVIDER: Record<string, ProviderModel[]> = {
     {
       "id": "gpt-5.5-image",
       "name": "GPT 5.5 Image"
-    },
-    {
-      "id": "gpt-5.4-image",
-      "name": "GPT 5.4 Image"
     },
     {
       "id": "gpt-5.3-image",
@@ -1089,12 +1200,28 @@ export const BUILTIN_MODELS_BY_PROVIDER: Record<string, ProviderModel[]> = {
       "name": "GPT-6 Sol"
     },
     {
+      "id": "grok-4.7",
+      "name": "Grok 4.7"
+    },
+    {
+      "id": "mimo-v2.6-flash:free",
+      "name": "MiMo V2.6 Flash (Free)"
+    },
+    {
+      "id": "mimo-v2.5:free",
+      "name": "MiMo V2.5 (Free)"
+    },
+    {
+      "id": "qwen3.8-flash:free",
+      "name": "Qwen 3.8 Flash (Free)"
+    },
+    {
       "id": "deepseek-v4.1-flash:free",
       "name": "DeepSeek V4.1 Flash (Free)"
     },
     {
-      "id": "grok-4.7",
-      "name": "Grok 4.7"
+      "id": "deepseek-v4-flash:free",
+      "name": "DeepSeek V4 Flash (Free)"
     }
   ],
   "dahl": [
@@ -1109,6 +1236,28 @@ export const BUILTIN_MODELS_BY_PROVIDER: Record<string, ProviderModel[]> = {
     {
       "id": "MiniMaxAI/MiniMax-M2.7",
       "name": "MiniMax M2.7"
+    }
+  ],
+  "agnes": [
+    {
+      "id": "agnes-2.5-flash",
+      "name": "Agnes 2.5 Flash"
+    },
+    {
+      "id": "agnes-2.5-pro",
+      "name": "Agnes 2.5 Pro"
+    },
+    {
+      "id": "agnes-2.5-pro-beta",
+      "name": "Agnes 2.5 Pro Beta"
+    },
+    {
+      "id": "agnes-3.0-flash",
+      "name": "Agnes 3.0 Flash"
+    },
+    {
+      "id": "agnes-3.0-pro",
+      "name": "Agnes 3.0 Pro"
     }
   ],
   "atria": [
@@ -2684,6 +2833,38 @@ export const BUILTIN_MODELS_BY_PROVIDER: Record<string, ProviderModel[]> = {
       "name": "MiMo Auto"
     }
   ],
+  "muse": [
+    {
+      "id": "muse-spark-1.3",
+      "name": "Muse Spark 1.3",
+      "targetFormat": "openai-responses",
+      "supportedFormats": ["openai-responses"]
+    },
+    {
+      "id": "muse-spark-1.2",
+      "name": "Muse Spark 1.2",
+      "targetFormat": "openai-responses",
+      "supportedFormats": ["openai-responses"]
+    },
+    {
+      "id": "muse-spark-1.1",
+      "name": "Muse Spark 1.1",
+      "targetFormat": "openai-responses",
+      "supportedFormats": ["openai-responses"]
+    },
+    {
+      "id": "muse-spark-1.3-contributor",
+      "name": "Muse Spark 1.3 Contributor",
+      "targetFormat": "openai-responses",
+      "supportedFormats": ["openai-responses"]
+    },
+    {
+      "id": "muse-spark-1.2-contributor",
+      "name": "Muse Spark 1.2 Contributor",
+      "targetFormat": "openai-responses",
+      "supportedFormats": ["openai-responses"]
+    }
+  ],
   "minimax-cn": [
     {
       "id": "MiniMax-M3",
@@ -2810,6 +2991,58 @@ export const BUILTIN_MODELS_BY_PROVIDER: Record<string, ProviderModel[]> = {
       "id": "speech-01-turbo",
       "name": "Speech 01 Turbo",
       "kind": "tts"
+    }
+  ],
+  "minimax-code": [
+    {
+      "id": "MiniMax-M3.1-Flash-Preview",
+      "name": "MiniMax M3.1 Flash Preview",
+      "targetFormat": "claude",
+      "supportedFormats": ["claude"]
+    },
+    {
+      "id": "MiniMax-M3",
+      "name": "MiniMax M3",
+      "targetFormat": "claude",
+      "supportedFormats": ["claude"]
+    },
+    {
+      "id": "MiniMax-M2.7",
+      "name": "MiniMax M2.7",
+      "targetFormat": "claude",
+      "supportedFormats": ["claude"]
+    },
+    {
+      "id": "MiniMax-M2.7-highspeed",
+      "name": "MiniMax M2.7 Highspeed",
+      "targetFormat": "claude",
+      "supportedFormats": ["claude"]
+    }
+  ],
+  "minimax-code-global": [
+    {
+      "id": "MiniMax-M3.1-Flash-Preview",
+      "name": "MiniMax M3.1 Flash Preview",
+      "targetFormat": "claude",
+      "supportedFormats": ["claude"]
+    },
+    {
+      "id": "MiniMax-M3",
+      "name": "MiniMax M3",
+      "targetFormat": "claude",
+      "supportedFormats": ["claude"]
+    },
+    {
+      "id": "MiniMax-M2.7",
+      "name": "MiniMax M2.7",
+      "targetFormat": "claude",
+      "supportedFormats": ["claude"]
+    },
+    {
+      "id": "MiniMax-M2.7-highspeed",
+      "name": "MiniMax M2.7 Highspeed",
+      "targetFormat": "claude",
+      "supportedFormats": ["claude"]
     }
   ],
   "mistral": [
@@ -3374,299 +3607,395 @@ export const BUILTIN_MODELS_BY_PROVIDER: Record<string, ProviderModel[]> = {
       "name": "Jev 1.13 Free",
       "kind": "systemone"
     },
-    {
-      "id": "union-alpha",
-      "name": "Union Alpha Free"
-    },
   ],
   "ocz": [
     {
       "id": "claude-fable-5",
-      "name": "Claude Fable 5"
+      "name": "Claude Fable 5",
+      "supportedFormats": ["claude"]
     },
     {
       "id": "claude-fable-5-1",
-      "name": "Claude Fable 5.1"
+      "name": "Claude Fable 5.1",
+      "supportedFormats": ["claude"]
     },
     {
       "id": "claude-opus-5",
-      "name": "Claude Opus 5"
+      "name": "Claude Opus 5",
+      "supportedFormats": ["claude"]
     },
     {
       "id": "claude-opus-4-8",
-      "name": "Claude Opus 4.8"
+      "name": "Claude Opus 4.8",
+      "supportedFormats": ["claude"]
     },
     {
       "id": "claude-opus-4-7",
-      "name": "Claude Opus 4.7"
+      "name": "Claude Opus 4.7",
+      "supportedFormats": ["claude"]
     },
     {
       "id": "claude-opus-4-6",
-      "name": "Claude Opus 4.6"
+      "name": "Claude Opus 4.6",
+      "supportedFormats": ["claude"]
     },
     {
       "id": "claude-opus-4-5",
-      "name": "Claude Opus 4.5"
+      "name": "Claude Opus 4.5",
+      "supportedFormats": ["claude"]
     },
     {
       "id": "claude-sonnet-5",
-      "name": "Claude Sonnet 5"
+      "name": "Claude Sonnet 5",
+      "supportedFormats": ["claude"]
     },
     {
       "id": "claude-sonnet-4-6",
-      "name": "Claude Sonnet 4.6"
+      "name": "Claude Sonnet 4.6",
+      "supportedFormats": ["claude"]
     },
     {
       "id": "claude-sonnet-4-5",
-      "name": "Claude Sonnet 4.5"
+      "name": "Claude Sonnet 4.5",
+      "supportedFormats": ["claude"]
     },
     {
       "id": "claude-sonnet-4",
-      "name": "Claude Sonnet 4"
+      "name": "Claude Sonnet 4",
+      "supportedFormats": ["claude"]
     },
     {
       "id": "claude-haiku-4-5",
-      "name": "Claude Haiku 4.5"
+      "name": "Claude Haiku 4.5",
+      "supportedFormats": ["claude"]
     },
     {
       "id": "gemini-3.6-flash",
-      "name": "Gemini 3.6 Flash"
+      "name": "Gemini 3.6 Flash",
+      "supportedFormats": ["openai"]
     },
     {
       "id": "gemini-3.8-flash",
-      "name": "Gemini 3.8 Flash"
+      "name": "Gemini 3.8 Flash",
+      "supportedFormats": ["openai"]
     },
     {
       "id": "gemini-3.7-flash",
-      "name": "Gemini 3.7 Flash"
+      "name": "Gemini 3.7 Flash",
+      "supportedFormats": ["openai"]
     },
     {
       "id": "gemini-3.5-flash-lite",
-      "name": "Gemini 3.5 Flash Lite"
+      "name": "Gemini 3.5 Flash Lite",
+      "supportedFormats": ["openai"]
     },
     {
       "id": "gemini-3.5-flash",
-      "name": "Gemini 3.5 Flash"
+      "name": "Gemini 3.5 Flash",
+      "supportedFormats": ["openai"]
     },
     {
       "id": "gemini-3.1-pro",
-      "name": "Gemini 3.1 Pro"
+      "name": "Gemini 3.1 Pro",
+      "supportedFormats": ["openai"]
     },
     {
       "id": "gemini-3-flash",
-      "name": "Gemini 3 Flash"
+      "name": "Gemini 3 Flash",
+      "supportedFormats": ["openai"]
     },
     {
       "id": "gpt-6-astra",
-      "name": "GPT 6 Astra"
+      "name": "GPT 6 Astra",
+      "targetFormat": "openai-responses",
+      "supportedFormats": ["openai-responses"]
     },
     {
       "id": "gpt-5.6-sol",
-      "name": "GPT 5.6 Sol"
+      "name": "GPT 5.6 Sol",
+      "targetFormat": "openai-responses",
+      "supportedFormats": ["openai-responses"]
     },
     {
       "id": "gpt-5.6-terra",
-      "name": "GPT 5.6 Terra"
+      "name": "GPT 5.6 Terra",
+      "targetFormat": "openai-responses",
+      "supportedFormats": ["openai-responses"]
     },
     {
       "id": "gpt-5.6-luna",
-      "name": "GPT 5.6 Luna"
+      "name": "GPT 5.6 Luna",
+      "targetFormat": "openai-responses",
+      "supportedFormats": ["openai-responses"]
     },
     {
       "id": "gpt-5.5",
-      "name": "GPT 5.5"
+      "name": "GPT 5.5",
+      "targetFormat": "openai-responses",
+      "supportedFormats": ["openai-responses"]
     },
     {
       "id": "gpt-5.5-pro",
-      "name": "GPT 5.5 Pro"
+      "name": "GPT 5.5 Pro",
+      "targetFormat": "openai-responses",
+      "supportedFormats": ["openai-responses"]
     },
     {
       "id": "gpt-5.4",
-      "name": "GPT 5.4"
+      "name": "GPT 5.4",
+      "targetFormat": "openai-responses",
+      "supportedFormats": ["openai-responses"]
     },
     {
       "id": "gpt-5.4-pro",
-      "name": "GPT 5.4 Pro"
+      "name": "GPT 5.4 Pro",
+      "targetFormat": "openai-responses",
+      "supportedFormats": ["openai-responses"]
     },
     {
       "id": "gpt-5.4-mini",
-      "name": "GPT 5.4 Mini"
+      "name": "GPT 5.4 Mini",
+      "targetFormat": "openai-responses",
+      "supportedFormats": ["openai-responses"]
     },
     {
       "id": "gpt-5.4-nano",
-      "name": "GPT 5.4 Nano"
+      "name": "GPT 5.4 Nano",
+      "targetFormat": "openai-responses",
+      "supportedFormats": ["openai-responses"]
     },
     {
       "id": "gpt-5.3-codex-spark",
-      "name": "GPT 5.3 Codex Spark"
+      "name": "GPT 5.3 Codex Spark",
+      "targetFormat": "openai-responses",
+      "supportedFormats": ["openai-responses"]
     },
     {
       "id": "gpt-5.3-codex",
-      "name": "GPT 5.3 Codex"
+      "name": "GPT 5.3 Codex",
+      "targetFormat": "openai-responses",
+      "supportedFormats": ["openai-responses"]
     },
     {
       "id": "gpt-5.2",
-      "name": "GPT 5.2"
+      "name": "GPT 5.2",
+      "targetFormat": "openai-responses",
+      "supportedFormats": ["openai-responses"]
     },
     {
       "id": "gpt-5.2-codex",
-      "name": "GPT 5.2 Codex"
+      "name": "GPT 5.2 Codex",
+      "targetFormat": "openai-responses",
+      "supportedFormats": ["openai-responses"]
     },
     {
       "id": "gpt-5.1",
-      "name": "GPT 5.1"
+      "name": "GPT 5.1",
+      "targetFormat": "openai-responses",
+      "supportedFormats": ["openai-responses"]
     },
     {
       "id": "gpt-5.1-codex-max",
-      "name": "GPT 5.1 Codex Max"
+      "name": "GPT 5.1 Codex Max",
+      "targetFormat": "openai-responses",
+      "supportedFormats": ["openai-responses"]
     },
     {
       "id": "gpt-5.1-codex",
-      "name": "GPT 5.1 Codex"
+      "name": "GPT 5.1 Codex",
+      "targetFormat": "openai-responses",
+      "supportedFormats": ["openai-responses"]
     },
     {
       "id": "gpt-5.1-codex-mini",
-      "name": "GPT 5.1 Codex Mini"
+      "name": "GPT 5.1 Codex Mini",
+      "targetFormat": "openai-responses",
+      "supportedFormats": ["openai-responses"]
     },
     {
       "id": "gpt-5",
-      "name": "GPT 5"
+      "name": "GPT 5",
+      "targetFormat": "openai-responses",
+      "supportedFormats": ["openai-responses"]
     },
     {
       "id": "gpt-5-codex",
-      "name": "GPT 5 Codex"
+      "name": "GPT 5 Codex",
+      "targetFormat": "openai-responses",
+      "supportedFormats": ["openai-responses"]
     },
     {
       "id": "gpt-5-nano",
-      "name": "GPT 5 Nano"
+      "name": "GPT 5 Nano",
+      "targetFormat": "openai-responses",
+      "supportedFormats": ["openai-responses"]
     },
     {
       "id": "grok-build-0.1",
-      "name": "Grok Build 0.1"
+      "name": "Grok Build 0.1",
+      "targetFormat": "openai-responses",
+      "supportedFormats": ["openai-responses"]
     },
     {
       "id": "grok-4.6",
-      "name": "Grok 4.6"
+      "name": "Grok 4.6",
+      "targetFormat": "openai-responses",
+      "supportedFormats": ["openai-responses"]
     },
     {
       "id": "grok-4.5",
-      "name": "Grok 4.5"
+      "name": "Grok 4.5",
+      "targetFormat": "openai-responses",
+      "supportedFormats": ["openai-responses"]
     },
     {
       "id": "muse-spark-1.3",
-      "name": "Muse Spark 1.3"
+      "name": "Muse Spark 1.3",
+      "targetFormat": "openai-responses",
+      "supportedFormats": ["openai-responses"]
     },
     {
       "id": "muse-spark-1.2",
-      "name": "Muse Spark 1.2"
+      "name": "Muse Spark 1.2",
+      "targetFormat": "openai-responses",
+      "supportedFormats": ["openai-responses"]
     },
     {
       "id": "qwen3.6-plus",
-      "name": "Qwen 3.6 Plus"
+      "name": "Qwen 3.6 Plus",
+      "supportedFormats": ["claude"]
     },
     {
       "id": "qwen3.5-plus",
-      "name": "Qwen 3.5 Plus"
+      "name": "Qwen 3.5 Plus",
+      "supportedFormats": ["claude"]
     },
     {
       "id": "deepseek-v4-pro",
-      "name": "DeepSeek V4 Pro"
+      "name": "DeepSeek V4 Pro",
+      "supportedFormats": ["openai"]
     },
     {
       "id": "deepseek-v4-flash",
-      "name": "DeepSeek V4 Flash"
+      "name": "DeepSeek V4 Flash",
+      "supportedFormats": ["openai"]
     },
     {
       "id": "deepseek-v4-flash-vision-exp",
-      "name": "DeepSeek V4 Flash Vision Exp"
+      "name": "DeepSeek V4 Flash Vision Exp",
+      "supportedFormats": ["openai"]
     },
     {
       "id": "glm-5.3-flash",
-      "name": "GLM 5.3 Flash (Vision)"
+      "name": "GLM 5.3 Flash (Vision)",
+      "supportedFormats": ["openai"]
     },
     {
       "id": "glm-5.3",
-      "name": "GLM 5.3"
+      "name": "GLM 5.3",
+      "supportedFormats": ["openai"]
     },
     {
       "id": "glm-5.2",
-      "name": "GLM 5.2"
+      "name": "GLM 5.2",
+      "supportedFormats": ["openai"]
     },
     {
       "id": "glm-5.1",
-      "name": "GLM 5.1"
+      "name": "GLM 5.1",
+      "supportedFormats": ["openai"]
     },
     {
       "id": "glm-5",
-      "name": "GLM 5"
+      "name": "GLM 5",
+      "supportedFormats": ["openai"]
     },
     {
       "id": "minimax-m3",
-      "name": "MiniMax M3"
+      "name": "MiniMax M3",
+      "supportedFormats": ["openai"]
     },
     {
       "id": "minimax-m2.7",
-      "name": "MiniMax M2.7"
+      "name": "MiniMax M2.7",
+      "supportedFormats": ["openai"]
     },
     {
       "id": "minimax-m2.5",
-      "name": "MiniMax M2.5"
+      "name": "MiniMax M2.5",
+      "supportedFormats": ["openai"]
     },
     {
       "id": "kimi-k3",
-      "name": "Kimi K3"
+      "name": "Kimi K3",
+      "supportedFormats": ["openai"]
     },
     {
       "id": "kimi-k2.7-code",
-      "name": "Kimi K2.7 Code"
+      "name": "Kimi K2.7 Code",
+      "supportedFormats": ["openai"]
     },
     {
       "id": "kimi-k2.6",
-      "name": "Kimi K2.6"
+      "name": "Kimi K2.6",
+      "supportedFormats": ["openai"]
     },
     {
       "id": "kimi-k2.5",
-      "name": "Kimi K2.5"
+      "name": "Kimi K2.5",
+      "supportedFormats": ["openai"]
     },
     {
       "id": "big-pickle",
-      "name": "Big Pickle"
+      "name": "Big Pickle",
+      "supportedFormats": ["openai"]
     },
     {
       "id": "union-alpha",
-      "name": "Union Alpha"
+      "name": "Union Alpha",
+      "supportedFormats": ["claude"]
     },
     {
       "id": "deepseek-v4-flash-free",
-      "name": "DeepSeek V4 Flash Free"
+      "name": "DeepSeek V4 Flash Free",
+      "supportedFormats": ["openai"]
     },
     {
       "id": "mimo-v2.6-flash-free",
-      "name": "MiMo V2.6 Flash Free"
+      "name": "MiMo V2.6 Flash Free",
+      "supportedFormats": ["openai"]
     },
     {
       "id": "mimo-v2.5-free",
-      "name": "MiMo V2.5 Free"
+      "name": "MiMo V2.5 Free",
+      "supportedFormats": ["openai"]
     },
     {
       "id": "ling-3.0-flash-fin-free",
-      "name": "Ling 3.0 Flash Fin Free"
+      "name": "Ling 3.0 Flash Fin Free",
+      "supportedFormats": ["openai"]
     },
     {
       "id": "nemotron-3-ultra-free",
-      "name": "Nemotron 3 Ultra Free"
+      "name": "Nemotron 3 Ultra Free",
+      "supportedFormats": ["openai"]
     },
     {
       "id": "nemotron-3.5-lightning-free",
-      "name": "Nemotron 3.5 Lightning Free"
+      "name": "Nemotron 3.5 Lightning Free",
+      "supportedFormats": ["openai"]
     },
     {
       "id": "muse-spark-1.3-contributor-free",
-      "name": "Muse Spark 1.3 Contributor Free"
+      "name": "Muse Spark 1.3 Contributor Free",
+      "targetFormat": "openai-responses",
+      "supportedFormats": ["openai-responses"]
     },
     {
       "id": "muse-spark-1.2-contributor-free",
-      "name": "Muse Spark 1.2 Contributor Free"
+      "name": "Muse Spark 1.2 Contributor Free",
+      "targetFormat": "openai-responses",
+      "supportedFormats": ["openai-responses"]
     },
     {
       "id": "jev-1.13",
@@ -4459,6 +4788,18 @@ export const BUILTIN_MODELS_BY_PROVIDER: Record<string, ProviderModel[]> = {
     {
       "id": "Kimi-K2.6",
       "name": "Kimi-K2.6"
+    }
+  ],
+  "v1m": [
+    {
+      "id": "rev-latest",
+      "name": "v1m Rev Latest (Calibrated)",
+      "kind": "systemone"
+    },
+    {
+      "id": "v1m-decision-engine",
+      "name": "v1m Decision Engine",
+      "kind": "systemone"
     }
   ],
   "voyage-ai": [
@@ -5746,6 +6087,32 @@ export const BUILTIN_MODELS_BY_PROVIDER: Record<string, ProviderModel[]> = {
       "id": "eleven_turbo_v2_5",
       "name": "Eleven Turbo v2.5",
       "kind": "tts"
+    },
+    {
+      "id": "scribe_v1",
+      "name": "Scribe v1",
+      "params": [
+        "language",
+        "response_format",
+        "timestamps_granularity",
+        "tag_audio_events",
+        "diarize",
+        "num_speakers"
+      ],
+      "kind": "stt"
+    },
+    {
+      "id": "scribe_v2",
+      "name": "Scribe v2",
+      "params": [
+        "language",
+        "response_format",
+        "timestamps_granularity",
+        "tag_audio_events",
+        "diarize",
+        "num_speakers"
+      ],
+      "kind": "stt"
     }
   ],
   "elevenlabs-tts-models": [

@@ -52,12 +52,18 @@ func ForwardCodex(w http.ResponseWriter, req *Request) error {
 	if err != nil {
 		return fmt.Errorf("transform body: %w", err)
 	}
+	// The ChatGPT Codex backend rejects a max_output_tokens it did not ask
+	// for; every chat-completions client sends one, so drop it here (#48).
+	transformedBody = stripCodexUnsupportedTokenParams(transformedBody)
+	// Only now that the "(level)" suffix is gone can the catalog id be mapped
+	// to its wire id, so this has to follow the transform rather than precede it.
+	transformedBody = rewriteCodexUpstreamModel(transformedBody)
 	cfg, transformedBody := applyCodexCompact(req.Config, transformedBody)
 	ctx := req.Ctx
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	resp, err := proxy.ForwardCodex(ctx, req.Client, cfg, req.APIKey, transformedBody, req.IsStream, req.ConnData)
+	resp, err := proxy.ForwardCodex(ctx, req.Client, cfg, req.APIKey, transformedBody, req.IsStream, req.ConnData, codexResponsesLiteBody(transformedBody))
 	if err != nil {
 		return fmt.Errorf("ForwardCodex: %w", err)
 	}
@@ -575,8 +581,6 @@ func ForwardOpencode(w http.ResponseWriter, req *Request) error {
 	_ = json.Unmarshal(req.Body, &reqObj)
 	cleanModel := strings.TrimPrefix(reqObj.Model, "oc/")
 	cleanModel = strings.TrimPrefix(cleanModel, "opencode/")
-	cleanModel = strings.TrimPrefix(cleanModel, "antigravity/")
-	cleanModel = strings.TrimPrefix(cleanModel, "ag/")
 	if parenIdx := strings.IndexByte(cleanModel, '('); parenIdx != -1 {
 		cleanModel = cleanModel[:parenIdx]
 	}
@@ -640,70 +644,6 @@ func ForwardOpencode(w http.ResponseWriter, req *Request) error {
 		}
 		return handleCodexStream(w, req, resp.Body)
 	}
-	if cleanModel == "union-alpha" {
-		// Route through Messages API format: https://opencode.ai/zen/v1/messages (PR #4099)
-		messagesURL := "https://opencode.ai/zen/v1/messages"
-		staticH := map[string]string(nil)
-		if req.Config != nil {
-			staticH = req.Config.StaticHeaders
-		}
-		isRelay := staticH != nil && staticH["x-relay-target"] != ""
-		if isRelay {
-			messagesURL = req.Config.BaseURL
-			headersCopy := make(map[string]string, len(staticH))
-			for k, v := range staticH {
-				headersCopy[k] = v
-			}
-			headersCopy["x-relay-path"] = "/zen/v1/messages"
-			staticH = headersCopy
-		} else if req.Config != nil && req.Config.BaseURL != "" && !strings.Contains(req.Config.BaseURL, "opencode.ai") {
-			base := strings.TrimRight(req.Config.BaseURL, "/")
-			if strings.HasSuffix(base, "/chat/completions") {
-				base = strings.TrimSuffix(base, "/chat/completions")
-			}
-			messagesURL = base + "/messages"
-		}
-		headers := proxy.BuildOpenCodeHeaders(staticH, req.SessionID, true)
-		headers["anthropic-version"] = "2023-06-01"
-		ctx := req.Ctx
-		if ctx == nil {
-			ctx = context.Background()
-		}
-		body := ensureMessagesMaxTokens(req.Body, cleanModel)
-		var msgMap map[string]any
-		if err := json.Unmarshal(body, &msgMap); err == nil {
-			msgMap["stream"] = true
-			if b, err := json.Marshal(msgMap); err == nil {
-				body = b
-			}
-		}
-		resp, err := proxy.DoRequest(ctx, req.Client, "POST", messagesURL, headers, body)
-		if err != nil {
-			return fmt.Errorf("ForwardOpencode (union-alpha messages route): %w", err)
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1*1024*1024))
-			return &proxy.UpstreamError{StatusCode: resp.StatusCode, Body: errBody}
-		}
-
-		if req.IsStream {
-			return handleClaudeMessagesStream(w, req, resp.Body)
-		}
-		var sseChunks []byte
-		var state translator.ClaudeToOpenAIStreamState
-		_ = proxy.ScanStream(resp.Body, func(payload []byte) {
-			if oaiChunk, cErr := translator.TranslateClaudeChunkToOpenAI(payload, &state); cErr == nil && oaiChunk != nil {
-				sseChunks = append(sseChunks, oaiChunk...)
-			}
-		})
-		converted, ok := sseToOpenAIJSON(sseChunks)
-		if !ok {
-			converted = sseChunks
-		}
-		return jsonResponse(req.Ctx, w, bytes.NewReader(converted), req.TranslateResp, req.ResponseBuf)
-	}
 
 	body := InjectReasoningContent(req.Body, "opencode")
 	// opencode Chat Completions path: same conceal + restore of tool names.
@@ -719,7 +659,10 @@ func ForwardOpencode(w http.ResponseWriter, req *Request) error {
 		if cleanModel != "" {
 			reqMap["model"] = cleanModel
 		}
-		if b, err := json.Marshal(reqMap); err == nil {
+		// Deterministic marshaling keeps the serialized request prefix
+		// stable across turns, which DeepSeek's prefix prompt cache
+		// requires; json/v2 randomizes map member order by default.
+		if b, err := marshalStable(reqMap); err == nil {
 			body = b
 		}
 	}
@@ -764,7 +707,6 @@ var opencodeGoMessagesModels = map[string]bool{
 	"qwen3.7-max":   true,
 	"qwen3.7-plus":  true,
 	"qwen3.6-plus":  true,
-	"union-alpha":   true,
 }
 
 // EnsureClaudeMessages exposes the OpenAI→Claude Messages request conversion
@@ -836,6 +778,17 @@ func ensureMessagesMaxTokens(body []byte, model string) []byte {
 		}
 	}
 
+	// 3b. parallel_tool_calls is OpenAI's single-tool-call policy; Claude
+	// spells it as a flag on tool_choice. Without tools there is nothing to
+	// restrict, so the flag would only add noise (#4581). Either way the
+	// OpenAI-only key is stripped, as step 5 does for other foreign fields.
+	if ptc, hasPTC := reqMap["parallel_tool_calls"]; hasPTC {
+		if ptc == false && hasClaudeTools(reqMap) {
+			reqMap["tool_choice"] = withDisabledParallelToolUse(reqMap["tool_choice"])
+		}
+		delete(reqMap, "parallel_tool_calls")
+	}
+
 	// 4. messages & system
 	if msgs, ok := reqMap["messages"].([]any); ok && len(msgs) > 0 {
 		extractedSys, claudeMsgs := convertOpenAIMessagesToClaude(msgs)
@@ -902,6 +855,9 @@ func convertOpenAIToolsToClaude(tools []any) []any {
 			if cc, ok := m["cache_control"]; ok {
 				cTool["cache_control"] = cc
 			}
+			if strict, ok := toolStrict(m, fn); ok {
+				cTool["strict"] = strict
+			}
 			out = append(out, cTool)
 			continue
 		}
@@ -921,6 +877,21 @@ func convertOpenAIToolsToClaude(tools []any) []any {
 	return out
 }
 
+// toolStrict resolves an explicit tool strict mode, preferring the flat
+// Responses/Codex shape and falling back to the Chat-Completions `function`
+// shape (parity with decolua/9router#4543/#4573). An absent or non-boolean
+// strict stays absent — the flag must never be invented.
+func toolStrict(tool, fn map[string]any) (bool, bool) {
+	if strict, ok := tool["strict"].(bool); ok {
+		return strict, true
+	}
+	if fn == nil {
+		return false, false
+	}
+	strict, ok := fn["strict"].(bool)
+	return strict, ok
+}
+
 func convertToolChoiceToClaude(tc any) any {
 	if tc == nil {
 		return nil
@@ -933,7 +904,9 @@ func convertToolChoiceToClaude(tc any) any {
 		case "required":
 			return map[string]any{"type": "any"}
 		case "none":
-			return nil
+			// Claude has a native "none"; dropping the key instead would hand
+			// the model the tool permission the client withheld (#4577).
+			return map[string]any{"type": "none"}
 		default:
 			return map[string]any{"type": "auto"}
 		}
@@ -949,6 +922,26 @@ func convertToolChoiceToClaude(tc any) any {
 	default:
 		return tc
 	}
+}
+
+// hasClaudeTools reports whether the body still declares at least one tool.
+// A policy about calling tools is meaningless without any.
+func hasClaudeTools(reqMap map[string]any) bool {
+	tools, ok := reqMap["tools"].([]any)
+	return ok && len(tools) > 0
+}
+
+// withDisabledParallelToolUse returns the Claude tool_choice carrying
+// disable_parallel_tool_use. An explicit choice keeps its type and name — the
+// restriction is added, never substituted — and only a missing choice is
+// filled in with Claude's own default, "auto" (parity #4581).
+func withDisabledParallelToolUse(tc any) map[string]any {
+	choice, ok := tc.(map[string]any)
+	if !ok {
+		choice = map[string]any{"type": "auto"}
+	}
+	choice["disable_parallel_tool_use"] = true
+	return choice
 }
 
 // sanitizeToolUseID returns a tool id valid for the Anthropic Messages API
@@ -1214,8 +1207,6 @@ func ForwardOpencodeGo(w http.ResponseWriter, req *Request) error {
 	cleanModel := strings.TrimPrefix(reqObj.Model, "oc/")
 	cleanModel = strings.TrimPrefix(cleanModel, "opencode-go/")
 	cleanModel = strings.TrimPrefix(cleanModel, "opencode/")
-	cleanModel = strings.TrimPrefix(cleanModel, "antigravity/")
-	cleanModel = strings.TrimPrefix(cleanModel, "ag/")
 	if parenIdx := strings.IndexByte(cleanModel, '('); parenIdx != -1 {
 		cleanModel = cleanModel[:parenIdx]
 	}
@@ -1287,7 +1278,7 @@ func ForwardOpencodeGo(w http.ResponseWriter, req *Request) error {
 		return handleCodexStream(w, req, resp.Body)
 	}
 
-	if opencodeGoMessagesModels[reqObj.Model] || opencodeGoMessagesModels[cleanModel] || cleanModel == "union-alpha" {
+	if opencodeGoMessagesModels[reqObj.Model] || opencodeGoMessagesModels[cleanModel] {
 		// Route to /zen/go/v1/messages (Anthropic/Claude format)
 		messagesURL := "https://opencode.ai/zen/go/v1/messages"
 		if req.Config != nil && req.Config.BaseURL != "" && !strings.Contains(req.Config.BaseURL, "opencode.ai") {
@@ -1333,7 +1324,10 @@ func ForwardOpencodeGo(w http.ResponseWriter, req *Request) error {
 		if cleanModel != "" {
 			reqGoMap["model"] = cleanModel
 		}
-		if b, err := json.Marshal(reqGoMap); err == nil {
+		// Deterministic marshaling keeps the serialized request prefix
+		// stable across turns, which DeepSeek's prefix prompt cache
+		// requires; json/v2 randomizes map member order by default.
+		if b, err := marshalStable(reqGoMap); err == nil {
 			body = b
 		}
 	}

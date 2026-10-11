@@ -3,7 +3,7 @@ package chat
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	json "9router/proxy/internal/fastjson"
 	"errors"
 	"fmt"
 	"io"
@@ -12,7 +12,9 @@ import (
 	"time"
 
 	"9router/proxy/internal/constants"
+	"9router/proxy/internal/guardrails"
 	"9router/proxy/internal/handlerutil"
+	"9router/proxy/internal/semanticcache"
 	"9router/proxy/internal/log"
 	"9router/proxy/internal/providers"
 	internalproxy "9router/proxy/internal/proxy"
@@ -31,7 +33,17 @@ func (h *ChatHandler) forwardRequest(
 	isStream bool,
 	translateResponse bool,
 	metrics *streamMetrics,
+	// httpClient is the connection's client, proxy pool included. It is a
+	// parameter because falling back to h.Client here would dial the provider
+	// directly for every provider without a custom executor — the assigned
+	// pool would look bound in the dashboard and never be used.
+	httpClient *http.Client,
 ) error {
+	// A nil client means the caller had no connection context; the shared one
+	// is the only sensible default.
+	if httpClient == nil {
+		httpClient = h.Client
+	}
 	// OpenAI-compat Gemini endpoints validate tool schemas as strictly as the
 	// native one — sanitize tools so no unsupported JSON-Schema keyword reaches
 	// them ("Invalid tool parameters" fix).
@@ -55,7 +67,7 @@ func (h *ChatHandler) forwardRequest(
 			}
 		}
 	}
-	resp, err := internalproxy.ForwardOpenAI(ctx, h.Client, cfg, apiKey, body, isStream)
+	resp, err := internalproxy.ForwardOpenAI(ctx, httpClient, cfg, apiKey, body, isStream)
 	if err != nil {
 		return fmt.Errorf("forward to upstream: %w", err)
 	}
@@ -72,7 +84,7 @@ func (h *ChatHandler) forwardRequest(
 		if err != nil {
 			return fmt.Errorf("read upstream error body: %w", err)
 		}
-		return &upstreamError{StatusCode: resp.StatusCode, Body: respBody}
+		return &upstreamError{StatusCode: resp.StatusCode, Body: respBody, Header: resp.Header}
 	}
 
 	start := time.Now()
@@ -100,7 +112,18 @@ func (h *ChatHandler) handleStreamResponse(ctx context.Context, w http.ResponseW
 	// Claude client, so this branch is decided by the client format alone. It
 	// runs before the header write because the bridge owns its own writer.
 	if translator.NeedsResponsesBridge(ctx) {
-		return executor.StreamChatToResponses(ctx, w, upstream, startTime, &metrics.TTFT, &metrics.ResponseBuf)
+		// The bridge defers response.completed until the upstream's usage
+		// trailer arrives, so once that wait begins the generic six-minute
+		// stall window is far too generous: an upstream that never sends the
+		// trailer would hold the client that long. One stall reader sized to
+		// the deferral bound ends the wait in step with the watchdog.
+		stream := upstream
+		if pending := executor.PendingCompletionFlushTimeout; pending > 0 {
+			if body, ok := upstream.(io.ReadCloser); ok {
+				stream = internalproxy.NewStallReaderWithContext(ctx, body, pending, "upstream pending completion")
+			}
+		}
+		return executor.StreamChatToResponses(ctx, w, stream, startTime, &metrics.TTFT, &metrics.ResponseBuf)
 	}
 
 	hw := internalproxy.NewHeartbeatWriter(ctx, w, 0)
@@ -180,12 +203,6 @@ func (h *ChatHandler) handleStreamResponse(ctx context.Context, w http.ResponseW
 		translator.SetUsage(ctx, usage)
 	}
 	return err
-}
-
-// isSSEBody reports whether body looks like SSE (forced-stream provider returned event stream for non-stream client).
-func isSSEBody(body []byte) bool {
-	trimmed := bytes.TrimSpace(body)
-	return bytes.HasPrefix(trimmed, []byte("event:")) || bytes.HasPrefix(trimmed, []byte("data:")) || bytes.Contains(trimmed, []byte("\ndata:"))
 }
 
 // sseToClaudeJSON aggregates OpenAI SSE chunks into a single chat.completion JSON for forced-SSE handling.
@@ -350,9 +367,40 @@ func (h *ChatHandler) handleJSONResponse(ctx context.Context, w http.ResponseWri
 
 	body = translator.UnwrapClineEnvelope(body)
 
+	// An SSE-only upstream ignores `stream:false` and answers with an event
+	// stream anyway. Fold it into one chat.completion before validating, so
+	// a stream that never carried a completion is a failure the fallback
+	// layer can act on rather than a 200 the client reads as an empty
+	// answer (port of executor codebuddy.go sseToOpenAIJSON, #3683).
+	if internalproxy.LooksLikeSSE(body) {
+		folded, ok := sseToClaudeJSON(body)
+		if !ok {
+			return internalproxy.UpstreamFailure(http.StatusBadGateway, internalproxy.NoCompletionInStream)
+		}
+		body = folded
+	}
+
+	// A 200 that carries no completion (blank body, HTML error page, a
+	// `{"error": ...}` envelope, a choice with empty content) reads to every
+	// layer above as a served turn, which both ends combo fallback and
+	// clears the account cooldown. Report it as the 502 it is.
+	if err := internalproxy.EmptyUpstreamError(body); err != nil {
+		return err
+	}
+
 	if metrics != nil {
 		metrics.ResponseBuf.Write(body)
 	}
+
+	// Outbound guardrails: the last point before the answer reaches the client.
+	// It sits after the empty-response check so a blocked body is not mistaken
+	// for a provider failure, and before the translate step so the policy sees
+	// the model's own words rather than a reshaped envelope.
+	filtered, gerr := guardrails.ApplyBuffered(ctx, body)
+	if gerr != nil {
+		return guardrailBlockedError()
+	}
+	body = filtered
 
 	// A /v1/responses client on a Chat Completions upstream needs the answer in
 	// the Responses shape; translate marks a Claude client, which it is not.
@@ -366,30 +414,20 @@ func (h *ChatHandler) handleJSONResponse(ctx context.Context, w http.ResponseWri
 		// providers). ParseResponseUsage handles both formats.
 		if usage := translator.ParseResponseUsage(body); usage != nil {
 			translator.SetUsage(ctx, usage)
+		} else if usage := translator.ParseOllamaUsage(body); usage != nil {
+			// Ollama's native shape carries its counters at the top level, not
+			// under `usage`, so ParseResponseUsage finds nothing there.
+			translator.SetUsage(ctx, usage)
+		}
+		if h.SemanticCache != nil && h.SemanticCache.Enabled() {
+			if cachedReq := semanticcache.CachedRequestFromContext(ctx); cachedReq != nil {
+				_ = h.SemanticCache.Store(ctx, cachedReq, body, "application/json")
+			}
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		w.Write(body)
 		return nil
-	}
-
-	// Forced-SSE handling for Claude clients (PR #3683): upstream forced to stream (e.g. Responses-API)
-	// but client did stream:false retry. Body is SSE, not JSON. Aggregate SSE chunks into
-	// a single OpenAI JSON then translate to Anthropic Message, so Claude Code can parse it.
-	if isSSEBody(body) {
-		if aggregated, ok := sseToClaudeJSON(body); ok {
-			translated, usage, err := translator.TranslateOpenAIToClaude(aggregated)
-			if err == nil && usage != nil {
-				translator.SetUsage(ctx, usage)
-			}
-			if err == nil && translated != nil {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusOK)
-				w.Write(translated)
-				return nil
-			}
-			// Fall through to normal handling if aggregation/translation fails
-		}
 	}
 
 	translated, usage, err := translator.TranslateOpenAIToClaude(body)
@@ -404,6 +442,11 @@ func (h *ChatHandler) handleJSONResponse(ctx context.Context, w http.ResponseWri
 		log.Error("json", "translate error", "msg", errMsg)
 		handlerutil.WriteJSONError(w, http.StatusBadGateway, errMsg)
 		return errors.New(errMsg)
+	}
+	if h.SemanticCache != nil && h.SemanticCache.Enabled() {
+		if cachedReq := semanticcache.CachedRequestFromContext(ctx); cachedReq != nil {
+			_ = h.SemanticCache.Store(ctx, cachedReq, translated, "application/json")
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -420,7 +463,7 @@ func (h *ChatHandler) respondAsResponses(ctx context.Context, w http.ResponseWri
 	// A Responses client that asked for a single JSON can still be handed an
 	// SSE stream when the provider forces one (Codex does). Aggregate it
 	// first rather than answering a client that expects JSON with a stream.
-	if isSSEBody(body) {
+	if internalproxy.LooksLikeSSE(body) {
 		if aggregated, ok := sseToClaudeJSON(body); ok {
 			body = aggregated
 		}

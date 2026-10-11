@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"9router/proxy/internal/handlers/chat"
+	"9router/proxy/internal/handlerutil"
 	"9router/proxy/internal/log"
 	"9router/proxy/internal/models"
 	"9router/proxy/internal/providers"
@@ -104,7 +105,7 @@ func (h *MediaHandler) handleAntigravitySTT(w http.ResponseWriter, r *http.Reque
 	excludeIDs := []string{}
 	var lastErr error
 	for {
-		conn, connData, err := h.ChatH.GetBestConnection("antigravity", pinned, excludeIDs, model)
+		conn, connData, err := h.ChatH.GetBestConnectionWithContext(r.Context(), "antigravity", pinned, excludeIDs, model)
 		if err != nil || conn == nil {
 			if lastErr != nil {
 				return lastErr
@@ -223,7 +224,10 @@ func (h *MediaHandler) tryAntigravitySTTConn(w http.ResponseWriter, r *http.Requ
 	httpReq.Header.Set("X-Client-Name", "antigravity")
 	httpReq.Header.Set("X-Client-Version", "2.11.0")
 
-	client := h.ChatH.GetClientForConnection(connData)
+	client, clientErr := h.ChatH.GetClientForConnection(connData)
+	if clientErr != nil {
+		return clientErr
+	}
 	resp, err := client.Do(httpReq)
 	if err != nil {
 		return fmt.Errorf("antigravity stt request failed: %w", err)
@@ -239,10 +243,12 @@ func (h *MediaHandler) tryAntigravitySTTConn(w http.ResponseWriter, r *http.Requ
 		log.Warn("media", "antigravity stt upstream error", "status", resp.StatusCode, "body", errText)
 		if h.Repo != nil {
 			backoff := h.Repo.GetConnectionBackoffLevel(conn.ID)
+		if !handlerutil.IsProbeContext(r.Context()) {
 			if classification := providers.ClassifyError(resp.StatusCode, errText, backoff); classification.ShouldFallback {
 				cooldownSec := max(classification.CooldownMs/1000, 1)
 				_ = h.Repo.LockConnectionModel(conn.ID, model, cooldownSec, classification.NewBackoffLevel)
 			}
+		}
 		}
 		return fmt.Errorf("antigravity stt failed with status %d: %s", resp.StatusCode, string(respBody[:min(300, len(respBody))]))
 	}
@@ -281,7 +287,11 @@ func (h *MediaHandler) tryAntigravitySTTConn(w http.ResponseWriter, r *http.Requ
 
 	if h.Repo != nil {
 		h.Repo.UpdateConnectionLastUsed(conn.ID)
-		_ = h.Repo.UnlockConnectionModel(conn.ID, model)
+		// Probes read production state; they never clear it (see
+		// tts_forward.go for the same reasoning on the failure path).
+		if !handlerutil.IsProbeContext(r.Context()) {
+			_ = h.Repo.UnlockConnectionModel(conn.ID, model)
+		}
 	}
 	usagetracker.GetTracker().PushRecent(usagetracker.RecentRequest{
 		Timestamp: time.Now().UTC().Format(time.RFC3339),

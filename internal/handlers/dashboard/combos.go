@@ -1,8 +1,8 @@
 package dashboard
 
 import (
-	"context"
 	json "encoding/json/v2"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -63,17 +63,19 @@ func (h *DashboardHandler) HandleCreateCombo(w http.ResponseWriter, r *http.Requ
 		req.Strategy = "fallback"
 	}
 
+	modelIDs, ok := normalizeComboModelIDs(req.Models)
+	if !ok {
+		handlerutil.WriteJSONError(w, http.StatusBadRequest, "models must contain valid model IDs")
+		return
+	}
 	modelsJSON := "[]"
-	if req.Models != nil {
-		switch m := req.Models.(type) {
-		case string:
-			modelsJSON = m
-		default:
-			b, err := json.Marshal(m)
-			if err == nil {
-				modelsJSON = string(b)
-			}
+	if len(modelIDs) > 0 {
+		encoded, err := json.Marshal(modelIDs)
+		if err != nil {
+			handlerutil.WriteJSONError(w, http.StatusInternalServerError, err.Error())
+			return
 		}
+		modelsJSON = string(encoded)
 	}
 	// A combo name is addressed bare, so it must not be shadowed by a model
 	// alias (consulted first) or read as a custom model id in /v1/models.
@@ -133,23 +135,22 @@ func (h *DashboardHandler) HandleUpdateCombo(w http.ResponseWriter, r *http.Requ
 	if kind == "" && existing.Kind != nil {
 		kind = *existing.Kind
 	}
-	if existing.Kind != nil && *existing.Kind == autoFreeComboKind {
-		if err := validateLockedReorder(existing, req, name, kind); err != nil {
-			handlerutil.WriteJSONError(w, http.StatusForbidden, err.Error())
+	modelsJSON := existing.Models
+	// An absent models field leaves the stored set alone; a present one is
+	// normalized the same way a create is, so an update cannot write the
+	// object rows a create refuses.
+	if req.Models != nil {
+		modelIDs, ok := normalizeComboModelIDs(req.Models)
+		if !ok {
+			handlerutil.WriteJSONError(w, http.StatusBadRequest, "models must contain valid model IDs")
 			return
 		}
-	}
-	modelsJSON := existing.Models
-	if req.Models != nil {
-		switch m := req.Models.(type) {
-		case string:
-			modelsJSON = m
-		default:
-			b, err := json.Marshal(m)
-			if err == nil {
-				modelsJSON = string(b)
-			}
+		encoded, err := json.Marshal(modelIDs)
+		if err != nil {
+			handlerutil.WriteJSONError(w, http.StatusInternalServerError, err.Error())
+			return
 		}
+		modelsJSON = string(encoded)
 	}
 	strategy := req.Strategy
 	if strategy == "" {
@@ -170,17 +171,22 @@ func (h *DashboardHandler) HandleUpdateCombo(w http.ResponseWriter, r *http.Requ
 }
 
 // autoFreeComboKind marks a combo that the dashboard auto-generates from the
-// registry's free-tier models. Such combos are locked: they can be reordered
-// (fallback order matters) but neither deleted nor edited by hand.
+// registry's free-tier models. The kind is informational: it tags the combo as
+// machine-generated so the card can badge it, and it is what Auto Free Tier
+// rewrites on every rebuild. It grants no lock — a generated combo is an
+// ordinary row that can be renamed, edited and deleted like any other, and
+// rebuilding after a delete recreates it.
 const autoFreeComboKind = "auto-free"
 
 // AutoFreeComboID is the stable id of the auto-generated free-tier combo.
 const AutoFreeComboID = "auto-free-tier"
 
 // HandleAutoFreeCombo handles POST /api/combos/auto-free.
-// (Re)builds the locked free-tier combo from registry models of providers the
-// user actually has a connection for, so the combo never references
-// unreachable providers.
+// (Re)builds the free-tier combo from registry models of providers the user
+// actually has a connection for, so the combo never references unreachable
+// providers. The write is an upsert on AutoFreeComboID, so rebuilding an
+// edited combo replaces the edits — which is why the rebuild is an explicit
+// button rather than something that happens on connection changes.
 func (h *DashboardHandler) HandleAutoFreeCombo(w http.ResponseWriter, r *http.Request) {
 	models, err := h.freeTierComboModels(r.Context())
 	if err != nil {
@@ -225,6 +231,13 @@ func (h *DashboardHandler) HandleAutoFreeCombo(w http.ResponseWriter, r *http.Re
 // freeTierComboModels returns "alias/model" ids for every free-tier registry
 // model of providers with at least one connection, ordered by provider alias
 // then model id so regenerating yields a stable, diffable list.
+//
+// The free-tier marker is a naming convention, not a service kind: ":free" /
+// "/free" / "-free" also lands on embedding, image, tts and stt models
+// (openrouter's "nvidia/llama-nemotron-embed-vl-1b-v2:free" is one). The
+// registry carries the real kind, so a combo that cannot serve a chat turn
+// never enters the fallback chain — same gate usableModelFamilies applies to
+// the auto-family combos.
 func (h *DashboardHandler) freeTierComboModels(ctx context.Context) ([]string, error) {
 	active, err := h.Repo.GetConnectedProviders(ctx)
 	if err != nil {
@@ -237,41 +250,14 @@ func (h *DashboardHandler) freeTierComboModels(ctx context.Context) ([]string, e
 			if !providers.IsFreeTierModel(modelID) {
 				continue
 			}
+			if kind := providers.GetProviderModelKind(providerID, modelID); kind != "" && kind != "llm" {
+				continue
+			}
 			out = append(out, providers.GetProviderAlias(providerID)+"/"+modelID)
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
 	return out, nil
-}
-
-// validateLockedReorder allows only a pure permutation of the locked combo's
-// models: the dashboard may reorder the fallback chain, but the model set,
-// name and kind stay the provider's registry truth.
-func validateLockedReorder(existing *models.Combo, req struct {
-	Name     string `json:"name"`
-	Kind     string `json:"kind"`
-	Models   any    `json:"models"`
-	Strategy string `json:"strategy"`
-}, name, kind string) error {
-	if name != "" && name != existing.Name {
-		return fmt.Errorf("auto free-tier combo name is locked")
-	}
-	if kind != "" && kind != *existing.Kind {
-		return fmt.Errorf("auto free-tier combo kind is locked")
-	}
-
-	current, err := comboModels(existing.Models)
-	if err != nil {
-		return err
-	}
-	next, err := comboModels(req.Models)
-	if err != nil {
-		return err
-	}
-	if len(next) != len(current) || !sameModelSet(current, next) {
-		return fmt.Errorf("auto free-tier combo models are locked; reorder only")
-	}
-	return nil
 }
 
 // comboModels extracts the model id array of a combo's stored models field,
@@ -305,35 +291,86 @@ func comboModels(v any) ([]string, error) {
 	}
 }
 
-// sameModelSet reports whether two arrays hold the same ids in any order.
-func sameModelSet(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
+// normalizeComboModelIDs turns the models field of a combo write into plain
+// model id strings, or reports false when an entry carries no id at all.
+//
+// The dashboard's own client only ever sends strings, but the same endpoint is
+// called by the legacy TUI, which sends the model objects it holds in memory:
+// {fullModel} or {provider, model}. Persisted verbatim those objects are stored
+// as objects in a column the reader (comboModels) only unmarshals as []string,
+// so the row comes back unreadable and takes the whole Combos view down with
+// it. Coercion happens at the API boundary instead of on read, because a row
+// already carrying objects cannot be told apart from a well-formed one — and
+// upstream does not migrate those either.
+//
+// A JSON array string is accepted as well: the client type is
+// `models: string | string[]`, and that string form is what the column holds.
+func normalizeComboModelIDs(v any) ([]string, bool) {
+	if v == nil {
+		return nil, true
 	}
-	seen := make(map[string]int, len(a))
-	for _, id := range a {
-		seen[id]++
-	}
-	for _, id := range b {
-		if seen[id] == 0 {
-			return false
+	if s, ok := v.(string); ok {
+		if strings.TrimSpace(s) == "" {
+			return nil, false
 		}
-		seen[id]--
+		var decoded any
+		if err := json.Unmarshal([]byte(s), &decoded); err != nil {
+			return nil, false
+		}
+		return normalizeComboModelIDs(decoded)
 	}
-	return true
+	entries, ok := v.([]any)
+	if !ok {
+		// A typed slice (a Go caller, or a round-tripped value) is not what
+		// json.Unmarshal produces, but the shapes are the same.
+		if typed, ok := v.([]string); ok {
+			entries = make([]any, len(typed))
+			for i, id := range typed {
+				entries[i] = id
+			}
+		} else {
+			return nil, false
+		}
+	}
+	ids := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		id, ok := comboModelID(entry)
+		if !ok {
+			return nil, false
+		}
+		ids = append(ids, id)
+	}
+	return ids, true
+}
+
+// comboModelID coerces one entry of a combo model list. A string is the id
+// itself; an object is one of the two legacy shapes, fullModel winning over
+// provider+model because the TUI writes both and fullModel is the resolved one.
+func comboModelID(entry any) (string, bool) {
+	switch e := entry.(type) {
+	case string:
+		if strings.TrimSpace(e) == "" {
+			return "", false
+		}
+		return e, true
+	case map[string]any:
+		if full, ok := e["fullModel"].(string); ok && strings.TrimSpace(full) != "" {
+			return full, true
+		}
+		provider, pok := e["provider"].(string)
+		model, mok := e["model"].(string)
+		if pok && mok && strings.TrimSpace(provider) != "" && strings.TrimSpace(model) != "" {
+			return provider + "/" + model, true
+		}
+	}
+	return "", false
 }
 
 // HandleDeleteCombo handles DELETE /api/combos/{id}.
-// Deletes combo, unless it is the locked auto free-tier combo.
 func (h *DashboardHandler) HandleDeleteCombo(w http.ResponseWriter, r *http.Request) {
 	id := getURLParam(r, "id")
 	if id == "" {
 		handlerutil.WriteJSONError(w, http.StatusBadRequest, "missing combo id")
-		return
-	}
-
-	if combo, _ := h.Repo.GetComboById(id); combo != nil && combo.Kind != nil && *combo.Kind == autoFreeComboKind {
-		handlerutil.WriteJSONError(w, http.StatusForbidden, "auto free-tier combo is locked")
 		return
 	}
 

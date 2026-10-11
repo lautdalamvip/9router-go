@@ -36,34 +36,67 @@ func (r *Repo) LockConnectionModel(connID, model string, durationSec int, backof
 	return nil
 }
 
-// ConnectionCooldownUntil reads the account-scoped cooldown a connection
+// ConnectionCooldownUntil reads the account-scoped quota cooldown a connection
 // carries in its data blob, mirroring upstream filterAvailableAccounts
 // (open-sse/services/accountFallback.js:180), which skips any account whose
 // rateLimitedUntil is still in the future.
 //
 // Unlike the model lock this cooldown is not keyed by model, which is what
-// catches a quota spent account-wide, and it is the only cooldown the
-// selector can consult when the request carries no model at all.
+// catches a quota spent account-wide, and it is the only quota cooldown the
+// selector can consult when the request carries no model at all. An account
+// parked for a rejected OAuth grant carries its own timestamp instead; read
+// both through ConnectionBlockedUntil.
 //
 // A missing, empty or unparseable value reports "not in cooldown" so a
 // malformed field can never take routing down.
 func ConnectionCooldownUntil(rawData string) (time.Time, bool) {
-	if rawData == "" {
+	raw, ok := parseConnData(rawData)
+	if !ok {
 		return time.Time{}, false
 	}
-	var raw map[string]any
-	if err := json.Unmarshal([]byte(rawData), &raw); err != nil {
-		return time.Time{}, false
+	return readTimestampField(raw, "rateLimitedUntil")
+}
+
+// RecordConnectionError stores the error message, status, and backoffLevel on
+// the connection row for dashboard visibility without setting an account-level
+// rateLimitedUntil cooldown.
+func (r *Repo) RecordConnectionError(connID string, status int, errText string, backoffLevel int) error {
+	return r.RecordConnectionScopedError(connID, "", "", status, errText, backoffLevel)
+}
+
+// RecordConnectionScopedError stores the error message, status, model, and source
+// on the connection row for dashboard visibility without setting rateLimitedUntil.
+func (r *Repo) RecordConnectionScopedError(connID, model, source string, status int, errText string, backoffLevel int) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	lastError := map[string]any{
+		"status":    status,
+		"message":   errText,
+		"timestamp": now,
 	}
-	untilStr, ok := raw["rateLimitedUntil"].(string)
-	if !ok || strings.TrimSpace(untilStr) == "" {
-		return time.Time{}, false
+	if model != "" {
+		lastError["model"] = model
 	}
-	until, err := time.Parse(time.RFC3339, untilStr)
+	if source != "" {
+		lastError["source"] = source
+	}
+	payload, err := json.Marshal(lastError)
 	if err != nil {
-		return time.Time{}, false
+		return fmt.Errorf("marshal last error for %s: %w", connID, err)
 	}
-	return until, true
+	_, err = r.db.Exec(
+		`UPDATE providerConnections
+		 SET data = json_set(data,
+		   '$.backoffLevel', ?,
+		   '$.lastError', json(?),
+		   '$.status', 'error'),
+		     updatedAt = ?
+		 WHERE id = ?`,
+		backoffLevel, string(payload), now, connID,
+	)
+	if err != nil {
+		return fmt.Errorf("record connection error %s: %w", connID, err)
+	}
+	return nil
 }
 
 // LockConnectionRateLimit stores the account-scoped cooldown and the error
@@ -189,6 +222,8 @@ func (r *Repo) ResetConnectionHealthState(connID string) error {
 
 	dataMap["errorCode"] = nil
 	dataMap["rateLimitedUntil"] = nil
+	dataMap["oauthLockedUntil"] = nil
+	dataMap["oauthFailureCount"] = 0
 	dataMap["backoffLevel"] = 0
 
 	for k := range dataMap {

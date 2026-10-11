@@ -41,9 +41,14 @@ const (
 //   - a bare `data: [DONE]` arriving without a prior terminal frame gains a
 //     `finish_reason: "stop"` frame first, otherwise the client fails with
 //     "stream closed before a finish_reason was received";
-//   - EOF before [DONE] gains `finish_reason: "network_error"` + [DONE];
-//   - a non-EOF read error gains the same best-effort terminator before the
-//     error is returned, so the client never sees a bare stream end.
+//   - EOF or a read error before [DONE] gains an in-band error frame.
+//
+// A provider-injected error event (OpenRouter relaying a dead downstream as
+// `choices: []` plus `error: {...}` on HTTP 200) is swallowed instead of
+// relayed and fails the turn: without this the stream reads as a served
+// success, usage is logged as success, and the sick connection is never
+// locked out of rotation. Detection is inline per line — no holdback, so the
+// first content byte still reaches the client as fast as before.
 func SSECopy(w http.ResponseWriter, upstream io.Reader, flusher http.Flusher, onChunk func([]byte)) error {
 	// Allocate a local buffer instead of using the shared pool. The buffer is
 	// alive for the entire read loop, so there is no safe point to return it
@@ -65,17 +70,21 @@ func SSECopy(w http.ResponseWriter, upstream io.Reader, flusher http.Flusher, on
 				return fmt.Errorf("write stream to client: %w", ferr)
 			}
 			if c.hasDone {
-				return nil
+				return c.inbandFailure()
 			}
 		}
 		if err != nil {
 			if err == io.EOF {
-				c.finish()
+				if ferr := c.finish(); ferr != nil {
+					return ferr
+				}
 				return nil
 			}
-			// Best-effort terminator so the client still sees a closed
-			// stream; the error itself is returned for logging/fallback.
-			c.finish()
+			// HTTP 200 is already on the wire, so the abort cannot be
+			// reported as a status code. Close it in-band instead: an
+			// error frame the client can parse, never a fabricated
+			// successful finish_reason (upstream 93001213).
+			c.abort(err)
 			return fmt.Errorf("read upstream stream: %w", err)
 		}
 	}
@@ -98,6 +107,12 @@ type sseCopier struct {
 	hasTerminal bool
 	hasDone     bool
 	seenSSE     bool
+	// seenInbandError tracks a provider-injected error event swallowed from
+	// the relay. inbandCode/Msg hold the first one seen; the turn fails only
+	// when no completion preceded it (inbandFailure).
+	seenInbandError bool
+	inbandCode      int
+	inbandMsg       string
 }
 
 // feed observes a raw read, forwards complete lines, and holds back the
@@ -145,32 +160,108 @@ func (c *sseCopier) hold(frag []byte) error {
 // sentinel line ends the stream: when no terminal frame preceded it, a
 // `finish_reason: "stop"` frame is injected first. Bytes after the sentinel
 // are dropped — nothing valid follows [DONE].
+//
+// Provider-injected error lines are swallowed, not relayed, so a dead
+// downstream never masquerades as content. Forwarding stays line-at-a-time:
+// segStart only ever trails already-written bytes, so the first content byte
+// is flushed exactly as fast as before (no holdback).
 func (c *sseCopier) writeEvents(complete []byte) error {
-	start := 0
+	start, segStart := 0, 0
 	for start < len(complete) {
 		eol := bytes.IndexByte(complete[start:], '\n') + start
-		if ssePayloadIsDone(complete[start : eol+1]) {
-			if err := c.writeRaw(complete[:start]); err != nil {
+		line := complete[start : eol+1]
+		if ssePayloadIsDone(line) {
+			if err := c.writeRaw(complete[segStart:start]); err != nil {
 				return err
 			}
-			if !c.hasTerminal {
-				if err := c.ensureBlank(); err != nil {
-					return err
-				}
-				if err := c.writeRaw([]byte(sseStopTerminal)); err != nil {
-					return err
-				}
-				c.hasTerminal = true
-			}
-			if err := c.writeRaw(complete[start : eol+1]); err != nil {
+			return c.writeDoneLine(line)
+		}
+		if c.swallowInbandError(line) {
+			if err := c.writeRaw(complete[segStart:start]); err != nil {
 				return err
 			}
-			c.hasDone = true
-			return nil
+			segStart = eol + 1
 		}
 		start = eol + 1
 	}
-	return c.writeRaw(complete)
+	return c.writeRaw(complete[segStart:])
+}
+
+// writeDoneLine closes the stream on the [DONE] sentinel. An error-only
+// stream (provider error, no completion) closes with the gateway's own error
+// frame instead of a fabricated successful terminal.
+func (c *sseCopier) writeDoneLine(line []byte) error {
+	if c.seenInbandError && !c.hasTerminal {
+		return c.writeErrorClose()
+	}
+	if !c.hasTerminal {
+		if err := c.ensureBlank(); err != nil {
+			return err
+		}
+		if err := c.writeRaw([]byte(sseStopTerminal)); err != nil {
+			return err
+		}
+		c.hasTerminal = true
+	}
+	if err := c.writeRaw(line); err != nil {
+		return err
+	}
+	c.hasDone = true
+	return nil
+}
+
+// swallowInbandError reports whether line is a provider-injected error event
+// that must not reach the client, recording the first one seen. An error
+// arriving after a terminal frame is left alone: the turn already completed,
+// so the answer stands (mirrors the codex stream rule that an upstream error
+// beside real output is not a failure).
+func (c *sseCopier) swallowInbandError(line []byte) bool {
+	if c.hasTerminal {
+		return false
+	}
+	if isEventErrorLine(line) {
+		return true
+	}
+	code, msg, ok := DetectInbandSSEError(line)
+	if !ok {
+		return false
+	}
+	if !c.seenInbandError {
+		c.seenInbandError = true
+		c.inbandCode, c.inbandMsg = code, msg
+	}
+	return true
+}
+
+// inbandFailure converts a recorded provider error into the turn failure the
+// fallback layer locks on — but only when the stream carried no completion.
+// A nil return keeps every healthy stream (and every completed turn) exactly
+// as successful as before.
+func (c *sseCopier) inbandFailure() error {
+	if c.seenInbandError && !c.hasTerminal {
+		return UpstreamFailure(c.inbandCode, c.inbandMsg)
+	}
+	return nil
+}
+
+// writeErrorClose ends an error-only turn with the gateway's own error frame
+// (which already carries the closing [DONE]) instead of a fabricated
+// successful finish_reason. OpenAI clients raise on a `data:` payload
+// carrying `error` rather than keeping truncated text (upstream 93001213).
+func (c *sseCopier) writeErrorClose() error {
+	if err := c.ensureBlank(); err != nil {
+		return err
+	}
+	if err := c.writeRaw(BuildStreamErrorBytes(c.inbandCode, c.inbandMsg, SSEFormatOpenAI)); err != nil {
+		return err
+	}
+	// Build the failure before marking the stream closed: inbandFailure only
+	// fires while no completion was recorded, and the flags below would
+	// disarm it.
+	failure := UpstreamFailure(c.inbandCode, c.inbandMsg)
+	c.hasTerminal = true
+	c.hasDone = true
+	return failure
 }
 
 // finish flushes any held fragment and closes an unterminated SSE stream the
@@ -178,11 +269,18 @@ func (c *sseCopier) writeEvents(complete []byte) error {
 // `finish_reason: "network_error"` unless a terminal frame was seen, then
 // [DONE]. A held `data: [DONE]` without trailing newline is a deliberate end
 // and gains the "stop" terminal instead.
-func (c *sseCopier) finish() {
+//
+// An error-only stream (provider error, no completion) closes with the
+// gateway's error frame and reports the failure, so the turn is locked out
+// of rotation instead of being logged as a served success.
+func (c *sseCopier) finish() error {
 	if len(c.pending) > 0 {
 		frag := c.pending
 		c.pending = nil
 		if ssePayloadIsDone(frag) {
+			if c.seenInbandError && !c.hasTerminal {
+				return c.writeErrorClose()
+			}
 			if !c.hasTerminal {
 				_ = c.ensureBlank()
 				_ = c.writeRaw([]byte(sseStopTerminal))
@@ -190,11 +288,16 @@ func (c *sseCopier) finish() {
 			}
 			_ = c.writeRaw([]byte(sseDoneFrame))
 			c.hasDone = true
-			return
+			return nil
 		}
-		_ = c.writeRaw(frag)
+		if !c.swallowInbandError(frag) {
+			_ = c.writeRaw(frag)
+		}
 	}
 	if c.seenSSE && !c.hasDone {
+		if c.seenInbandError && !c.hasTerminal {
+			return c.writeErrorClose()
+		}
 		_ = c.ensureBlank()
 		if !c.hasTerminal {
 			_ = c.writeRaw([]byte(sseTruncatedTerminal))
@@ -202,6 +305,32 @@ func (c *sseCopier) finish() {
 		_ = c.writeRaw([]byte(sseDoneFrame))
 		c.hasDone = true
 	}
+	return c.inbandFailure()
+}
+
+// abort closes a stream that died after HTTP 200 with an in-band error frame
+// instead of a terminal finish_reason. A fabricated "stop" or "network_error"
+// finish_reason is worse than nothing: OpenAI clients treat both as a normal
+// completion and keep the truncated text, so a stall timeout and a dropped
+// socket are indistinguishable from a finished answer. The error frame is
+// what makes the difference visible (upstream decolua/9router 93001213).
+func (c *sseCopier) abort(cause error) {
+	if len(c.pending) > 0 {
+		frag := c.pending
+		c.pending = nil
+		_ = c.writeRaw(frag)
+	}
+	if !c.seenSSE || c.hasDone {
+		return
+	}
+	code, message := ClassifyStreamAbort(cause)
+	_ = c.ensureBlank()
+	// OpenAI shape only: SSECopy only ever serves OpenAI-format clients. The
+	// Claude-named path terminates in the executor that already owns that
+	// translation, and sends its own event: error frame.
+	_ = c.writeRaw(BuildStreamErrorBytes(code, message, SSEFormatOpenAI))
+	c.hasTerminal = true
+	c.hasDone = true
 }
 
 // observe records terminal tokens from raw bytes, including tokens split

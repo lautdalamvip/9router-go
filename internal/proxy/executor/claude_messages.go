@@ -16,6 +16,12 @@ import (
 // handleClaudeMessagesStream pipes a Claude Messages SSE stream from upstream,
 // translating chunks to OpenAI SSE format when the downstream client is an OpenAI client.
 func handleClaudeMessagesStream(w http.ResponseWriter, req *Request, upstream io.Reader) error {
+	// Built before either branch returns: a /v1/messages client on a Claude
+	// upstream still needs fitted tool names restored, and the TranslateResp
+	// passthrough below used to skip the decloaker entirely, forwarding the
+	// fitted name so the client could not dispatch the call.
+	decloaker := NewClaudeStreamDecloaker(req.ToolNameMap)
+
 	if req.TranslateResp {
 		startTime := req.StartTime
 		if startTime.IsZero() {
@@ -24,7 +30,7 @@ func handleClaudeMessagesStream(w http.ResponseWriter, req *Request, upstream io
 		hw := proxy.NewHeartbeatWriter(req.Ctx, w, 0)
 		defer hw.Close()
 		flusher := proxy.WriteSSEHeaders(hw)
-		return proxy.ScanStream(upstream, func(payload []byte) {
+		writeFrame := func(payload []byte) {
 			if req.TTFT != nil && *req.TTFT == 0 {
 				*req.TTFT = time.Since(startTime).Milliseconds()
 			}
@@ -42,6 +48,15 @@ func handleClaudeMessagesStream(w http.ResponseWriter, req *Request, upstream io
 			if usage := translator.ParseClaudeUsage(raw); usage != nil {
 				translator.SetUsage(req.Ctx, usage)
 			}
+		}
+		return proxy.ScanStream(upstream, func(payload []byte) {
+			if decloaker != nil {
+				for _, ev := range decloaker.Events(payload) {
+					writeFrame(ev.Payload)
+				}
+				return
+			}
+			writeFrame(payload)
 		})
 	}
 
@@ -67,10 +82,14 @@ func handleClaudeMessagesStream(w http.ResponseWriter, req *Request, upstream io
 		)
 	}
 
-	state := &translator.ClaudeToOpenAIStreamState{}
+	// A Messages stream that omits `model` still has to echo one back, and
+	// the model the client asked for is the value that is actually true. The
+	// translator's own fallback is a placeholder, not a substitute for this.
+	state := &translator.ClaudeToOpenAIStreamState{
+		Model: translator.RequestedModelFromContext(req.Ctx),
+	}
 	doneSeen := false
 	sawTerminal := false // saw message_delta (with stop_reason) or message_stop
-	decloaker := NewClaudeStreamDecloaker(req.ToolNameMap)
 	var writeErr error
 	emit := func(payload []byte) {
 		if doneSeen || writeErr != nil {
@@ -148,6 +167,13 @@ func handleClaudeMessagesStream(w http.ResponseWriter, req *Request, upstream io
 		return fmt.Errorf("write to client: %w", writeErr)
 	}
 
+	// The upstream is fully drained here, so the completion watchdog has nothing
+	// left to give up on. Cancelling it before Close keeps the timer from
+	// firing into a writer this function is about to tear down.
+	if bridge != nil {
+		bridge.StopCompletionWatchdog()
+	}
+
 	// A Responses client waits for response.completed, not [DONE], so the bridge
 	// closes before the fallback below can call the stream unfinished.
 	if bridge != nil {
@@ -181,15 +207,18 @@ func handleClaudeMessagesNonStream(w http.ResponseWriter, req *Request, upstream
 		return fmt.Errorf("read claude response body: %w", err)
 	}
 
-	if req.TranslateResp {
-		// Client requested Claude format, upstream is Claude format: pass through
-		return jsonResponse(req.Ctx, w, bytes.NewReader(body), false, req.ResponseBuf)
-	}
-
+	// Decloak before either return. The passthrough is not exempt: a
+	// /v1/messages client still needs the caller's original tool name back, and
+	// restoring after the translate branch would miss every Claude-native body.
 	if req.ToolNameMap != nil {
 		// Claude OAuth tool cloaking: restore original tool names before
 		// translating / forwarding the response to the client.
 		body = DecloakClaudeResponseBody(body, req.ToolNameMap)
+	}
+
+	if req.TranslateResp {
+		// Client requested Claude format, upstream is Claude format: pass through
+		return jsonResponse(req.Ctx, w, bytes.NewReader(body), false, req.ResponseBuf)
 	}
 
 	// Client requested OpenAI format, upstream is Claude format: translate!

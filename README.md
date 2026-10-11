@@ -10,8 +10,9 @@
 [![Release](https://github.com/luqman-v1/9router-go/actions/workflows/release.yml/badge.svg)](https://github.com/luqman-v1/9router-go/actions/workflows/release.yml)
 [![GitHub release](https://img.shields.io/github/v/release/luqman-v1/9router-go)](https://github.com/luqman-v1/9router-go/releases/latest)
 [![License](https://img.shields.io/github/license/luqman-v1/9router-go)](https://github.com/luqman-v1/9router-go/blob/main/LICENSE)
+[![Telegram](https://img.shields.io/badge/Telegram-Join%20Group-26A5E1?logo=telegram&logoColor=white)](https://luqman-v1.github.io/9router-go/tg)
 
-[🚀 Quick Start](#-quick-start) • [💡 Features](#-key-features) • [⚙️ Setup](#-setup-guide) • [🌐 Upstream](https://github.com/decolua/9router)
+[🚀 Quick Start](#-quick-start) • [💡 Features](#-key-features) • [⚙️ Setup](#-setup-guide) • [🔄 Share DB with 9Router](#-sharing-a-database-with-9router) • [🌐 Upstream](https://github.com/decolua/9router)
 
 </div>
 
@@ -32,7 +33,13 @@ Same idea as [9Router](https://github.com/decolua/9router), minus the Node.js ru
 
 - ✅ **RTK Token Saver** — auto-compress tool_result content, save 20-40% tokens
 - ✅ **Auto fallback** — Subscription → Cheap → Free, zero downtime
+- ✅ **Extended combo routing** — per-combo strategy: fallback, round-robin, sticky, capacity, or fusion
 - ✅ **Multi-account** — round-robin between accounts per provider
+- ✅ **Proxy per API key** — bind a proxy pool to each provider API key (connection), one-by-one or via **Apply Proxy** across many at once
+- ✅ **Custom headers** — add your own request headers to custom compatible providers
+- ✅ **Unified custom provider add** — one shared dialog adds OpenAI-/Anthropic-compatible endpoints
+- ✅ **Custom usage ranges** — analyze any window (`14d`, `12h`), not just fixed presets
+- ✅ **Extended logging** — live console log with level filters & search, plus per-request payload inspector
 - ✅ **Single binary** — Go + embedded dashboard, works with Claude Code, Codex, Cursor, Cline, any CLI tool
 
 ---
@@ -85,7 +92,25 @@ irm https://raw.githubusercontent.com/luqman-v1/9router-go/main/install.ps1 | ie
 9router-go
 # Dashboard: http://localhost:20130 (Default password: 123456)
 ```
-> Already use upstream 9Router? Point Go at the same data dir — it opens the **same `DATA_DIR/db/data.sqlite`**: providers, connections, combos, and usage carry over. Details in [`DATABASE.md`](DATABASE.md).
+> **Already using upstream [9Router](https://github.com/decolua/9router)?** Point 9router-go at the same data dir — it opens the **same `DATA_DIR/db/data.sqlite`**. Your providers, connections, combos, API keys, and usage history carry over as-is. No import step, no migration. See [Sharing a database with 9Router](#-sharing-a-database-with-9router) for the caveats.
+
+**Keep the terminal free (background mode):**
+
+```bash
+9router-go start          # same as: 9router-go --background   (or -d)
+9router-go status         # is it running? (pid, dashboard, log)
+9router-go restart        # replace the running daemon
+9router-go logs -n 100    # tail the background log
+9router-go stop           # stop it
+```
+
+The detached process records itself in `DATA_DIR/run/gateway.pid` and writes its
+output to `DATA_DIR/run/gateway.log`. A second `start` while one is running
+refuses instead of fighting over the port, and a daemon killed from Task Manager
+leaves nothing behind: the stale pid file is cleaned on the next command.
+> Windows stops the process with `TerminateProcess` instead of `SIGTERM`, so
+> stopping skips the graceful drain; use the dashboard's Shutdown button or
+> `9router-go restart` when you want in-flight streams to finish first.
 
 **2. Connect a FREE provider (no signup needed):**
 
@@ -132,11 +157,78 @@ docker run -d --name 9router-go --restart unless-stopped \
 
 ---
 
+## 🔄 Sharing a database with 9Router
+
+**Already running [9Router](https://github.com/decolua/9router) (the Next.js version)? 9router-go reads that exact database. There is no import, no export, and no migration step.**
+
+Both projects default to the same file and speak the same schema:
+
+| | Path |
+|---|---|
+| macOS / Linux | `~/.9router/db/data.sqlite` |
+| Windows | `%APPDATA%\9router\db\data.sqlite` |
+| Docker | `/data/db/data.sqlite` inside the container |
+
+Stop 9Router, start 9router-go, and log in with your existing password. Your provider connections, proxy pools, combos, API keys, model aliases, and usage history are all there — 9router-go's own dashboard renders them, because it *is* the same data.
+
+**You don't even have to stop 9Router** if you want to keep the Node.js dashboard around. Run 9router-go on a different port against the same `DATA_DIR`:
+
+```bash
+# 9Router on :20128 (Next.js)  ·  9router-go on :20130 (Go, same DB)
+PORT=20130 DATA_DIR=/home/you/.9router ./9router-go
+```
+
+Both read the same tables, so a connection you add in either dashboard shows up in the other. SQLite serialises the writes; the supported setup is one active writer, so avoid editing the same combo or settings entry in both at the same moment.
+
+**Running it the other way round** (9router-go first, then pointing 9Router at the same directory) works the same way. 9router-go will have added two columns to `providerConnections` (`lastUsedAt`, `consecutiveUseCount`) and one extra table (`upstream_leases`). Upstream ignores both — its schema sync is additive and doesn't drop unknown columns — so nothing breaks.
+
+What 9router-go will **not** do:
+
+- **Import a legacy JSON export.** If your 9Router data still lives in old JSON files, start upstream once to convert them, then switch.
+- **Run destructive migrations or pre-migration backups.** Its bootstrap only ever *adds* — create missing tables, add missing columns, seed missing rows. It never drops or retypes.
+- **Interpret `_meta.schemaVersion`.** It's upstream's migration bookkeeping. A database written by a much newer 9Router release should be checked before you rely on it.
+
+Take a backup first if the database matters:
+
+```bash
+cp -r ~/.9router/db ~/9router-db-backup   # stop the daemon first — see DATABASE.md
+```
+
+Full schema, operator contract, and multi-process limits: [`DATABASE.md`](DATABASE.md). Routing internals: [`ARCHITECTURE.md`](ARCHITECTURE.md).
+
+---
+
+## 📸 Screenshots
+
+![9router-go dashboard — Providers view](docs/screenshots/providers.png)
+
+![9router-go dashboard — Endpoint & API key setup](docs/screenshots/endpoint.png)
+
+---
+
 ## ⚙️ Setup Guide
 
 ### Release binary
 
 Download from [GitHub Releases](https://github.com/luqman-v1/9router-go/releases/latest), verify against `SHA256SUMS.txt`.
+
+### 🧪 Experimental builds
+
+Unreleased work also ships as **experimental** builds. They are published
+separately and are never offered to a normal install:
+
+- GitHub Releases marks them **Pre-release**, so `releases/latest` — the URL
+  `9router-go update` falls back to — keeps pointing at the stable version.
+- Docker Hub tags them `exp` (`luqmenul/9router-go:exp`), never `latest`.
+
+```bash
+docker pull luqmenul/9router-go:exp
+```
+
+Opt in only if you want to help shake out bugs. `9router-go update` will not
+install one over a stable release — grab the asset for your platform from the
+[pre-releases page](https://github.com/luqman-v1/9router-go/releases) and
+replace the running binary with it.
 
 ### Build from source
 
@@ -250,13 +342,30 @@ Go reads/writes the upstream 9router table/JSON shapes and bootstraps the core s
 
 ---
 
+## 🤝 Contributing
+
+Issues and pull requests use templates, so pick the right one rather than opening a blank report:
+
+- **Bug report** — something behaves incorrectly. Include a reproduction, `9router-go version`, OS, and the log excerpt around the failure.
+- **Feature request** — the problem you cannot solve today, the surface it touches, and whether upstream already has it.
+- **Upstream parity** — a behaviour `decolua/9router` has and this gateway does not; link the upstream commit or PR.
+- **Question** — configuration and usage help.
+
+PRs follow the checks CI runs: `go vet ./...`, `go test -count=1 ./...`, `make test-integration`, plus `cd web && bun test` and `make vet-svelte` for anything touching the dashboard. Before writing code, skim [`AGENTS.md`](AGENTS.md) — provider isolation and the Go/Svelte conventions there are enforced by review.
+
+
 ## 📚 Docs
 
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — routing, providers, runtime layout
 - [`DATABASE.md`](DATABASE.md) — SQLite schema & operator contract
 - [`ROADMAP.md`](ROADMAP.md) — proposals only, not current behavior
-- [`CHANGELOG.md`](CHANGELOG.md) — release history (Go **v1.9.2**, upstream baseline `decolua/9router` v0.5.85)
+- [`CHANGELOG.md`](CHANGELOG.md) — release history (Go **v1.9.9**, upstream baseline `decolua/9router` v0.5.85). Work merged since the last tag lives in [`.changes/`](.changes/) and is folded in at the next release; the dashboard's changelog modal shows both.
+- [`docs/TELEGRAM_RELEASE_NOTIFICATIONS.md`](docs/TELEGRAM_RELEASE_NOTIFICATIONS.md) — one-time setup for the release notice posted to Telegram
 
 ## Credits
 
 - [9Router](https://github.com/decolua/9router) — original Next.js gateway & dashboard this Go port preserves compatibility with
+
+## 📄 License
+
+MIT License — lihat [`LICENSE`](https://github.com/luqman-v1/9router-go/blob/main/LICENSE).

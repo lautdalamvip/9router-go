@@ -3,7 +3,10 @@
 /9router-go-*
 /SHA256SUMS.txt
 *.exe
+*.exe~
 web/dist/
+web/.dist-stamp
+_site/
 
 # Test binaries
 *.test
@@ -37,3 +40,4 @@ stitch-screenshots/
 # them as embedded gitlinks. A worktree caught in a commit has to be undone
 # with `git rm --cached` before it reaches the remote.
 .worktrees/
+.smoke-data/

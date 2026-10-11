@@ -1,5 +1,15 @@
 import { describe, expect, it } from 'bun:test'
-import { api, formatApiError, getAuthHeaders, getStoredAPIKey, isUsableAPIKey, onUnauthorized, responseErrorMessage } from './client'
+import {
+  api,
+  formatApiError,
+  getAuthHeaders,
+  getStoredAPIKey,
+  isUsableAPIKey,
+  normalizeConnection,
+  onUnauthorized,
+  responseErrorMessage,
+  type ProviderConnection,
+} from './client'
 
 describe('dashboard API authentication and errors', () => {
 
@@ -169,5 +179,138 @@ describe('dashboard API authentication and errors', () => {
     }
 
     expect(urls[0]).toBe('/api/usage/id%20with%2Fslash/reset-credits')
+  })
+
+  it('normalizes object lastError to string message when listing connections', async () => {
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = async () => {
+      return Response.json([
+        {
+          id: 'conn-1',
+          provider: 'openai-compatible-chat-123',
+          authType: 'apikey',
+          isActive: 1,
+          data: JSON.stringify({
+            lastError: {
+              status: 429,
+              message: 'Rate limit exceeded: resets in 10s',
+              timestamp: '2026-09-30T12:00:00Z',
+            },
+          }),
+        },
+        {
+          id: 'conn-2',
+          provider: 'openai-compatible-chat-456',
+          authType: 'apikey',
+          isActive: 1,
+          lastError: {
+            status: 500,
+            error: 'Internal upstream error',
+          },
+        },
+      ])
+    }
+    try {
+      const conns = await api.getConnections()
+      expect(conns.length).toBe(2)
+      expect(conns[0].lastError).toBe('Rate limit exceeded: resets in 10s')
+      expect(conns[1].lastError).toBe('Internal upstream error')
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  it('normalizes object lastError in getProvidersClient and getProvidersClientPage', async () => {
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = async () => {
+      return Response.json({
+        connections: [
+          {
+            id: 'conn-1',
+            provider: 'openai-compatible-chat-123',
+            authType: 'apikey',
+            isActive: 1,
+            lastError: { message: 'Quota exhausted' },
+          },
+        ],
+      })
+    }
+    try {
+      const clientRes = await api.getProvidersClient()
+      expect(clientRes.connections[0].lastError).toBe('Quota exhausted')
+
+      const pageRes = await api.getProvidersClientPage('page=1')
+      expect(pageRes.connections[0].lastError).toBe('Quota exhausted')
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  describe('normalizeConnection providerSpecificData handling', () => {
+    it('preserves providerSpecificData directly from wire when c.data is undefined', () => {
+      const raw = {
+        id: 'conn-1',
+        provider: 'openai',
+        authType: 'apikey',
+        isActive: 1,
+        providerSpecificData: { proxyPoolId: 'pool-test-123' },
+      } as unknown as ProviderConnection
+
+      const normalized = normalizeConnection(raw)
+      expect(normalized.providerSpecificData).toEqual({ proxyPoolId: 'pool-test-123' })
+    })
+
+    it('parses and populates providerSpecificData from legacy c.data JSON string', () => {
+      const raw = {
+        id: 'conn-2',
+        provider: 'openai',
+        authType: 'apikey',
+        isActive: 1,
+        data: JSON.stringify({
+          providerSpecificData: { proxyPoolId: 'pool-legacy-456' },
+        }),
+      } as unknown as ProviderConnection
+
+      const normalized = normalizeConnection(raw)
+      expect(normalized.providerSpecificData).toEqual({ proxyPoolId: 'pool-legacy-456' })
+    })
+
+    it('merges cleanly with wire providerSpecificData taking precedence over parsed data', () => {
+      const raw = {
+        id: 'conn-3',
+        provider: 'openai',
+        authType: 'apikey',
+        isActive: 1,
+        data: JSON.stringify({
+          providerSpecificData: {
+            proxyPoolId: 'pool-legacy-old',
+            customHeader: 'legacy-val',
+          },
+        }),
+        providerSpecificData: {
+          proxyPoolId: 'pool-wire-override',
+          newSetting: true,
+        },
+      } as unknown as ProviderConnection
+
+      const normalized = normalizeConnection(raw)
+      expect(normalized.providerSpecificData).toEqual({
+        proxyPoolId: 'pool-wire-override',
+        customHeader: 'legacy-val',
+        newSetting: true,
+      })
+    })
+
+    it('returns an empty object rather than undefined when no providerSpecificData exists', () => {
+      const raw = {
+        id: 'conn-4',
+        provider: 'openai',
+        authType: 'apikey',
+        isActive: 1,
+      } as unknown as ProviderConnection
+
+      const normalized = normalizeConnection(raw)
+      expect(normalized.providerSpecificData).toEqual({})
+    })
   })
 })

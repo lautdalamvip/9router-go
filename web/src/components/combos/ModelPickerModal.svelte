@@ -1,14 +1,20 @@
+<script module lang="ts">
+  import type { ResolvedPickerExtras } from './pickerExtras'
+  let cachedPickerExtras: ResolvedPickerExtras | null = null
+</script>
+
 <script lang="ts">
   import { Info, Search, X } from 'lucide-svelte'
   import { api, type Combo, type ProviderConnection, type ProviderNode } from '../../api/client'
   import ModelPill from './ModelPill.svelte'
-  import { getIconPath } from '../connections/types'
+  import ProviderArtwork from '../providers/ProviderArtwork.svelte'
   import {
     resolveFilteredCombos,
     resolveFilteredGroups,
     resolveModelPickerGroups,
   } from './pickerData'
-  import { parseCustomModelsResponse, parseDisabledModelsMap } from '../../lib/customModels'
+  import { EMPTY_PICKER_EXTRAS, loadPickerExtras, type ResolvedPickerExtras } from './pickerExtras'
+  import { emailPrivacy, formatEmailLabel } from '../../lib/privacy'
 
   interface Props {
     isOpen: boolean
@@ -19,6 +25,8 @@
     modelAliases?: Record<string, string>
     customModels?: Array<{ providerAlias?: string; id: string; name?: string; type?: string }>
     disabledModels?: Record<string, string[]>
+    /** Overrides the batched fetch; the provider page passes its own cache. */
+    deprecations?: Record<string, unknown>
     currentComboName?: string
     addedModelValues?: string[]
     onSelect: (modelValue: string) => void
@@ -35,6 +43,7 @@
     modelAliases,
     customModels,
     disabledModels,
+    deprecations,
     currentComboName,
     addedModelValues = [],
     onSelect,
@@ -43,44 +52,34 @@
   }: Props = $props()
 
   let searchQuery = $state('')
-  let fetchedAliases = $state<Record<string, string>>({})
-  let fetchedCustoms = $state<Array<{ providerAlias?: string; id: string; name?: string; type?: string }>>([])
-  let fetchedDisabled = $state<Record<string, string[]>>({})
+  let fetchedExtras = $state<ResolvedPickerExtras>(cachedPickerExtras ?? EMPTY_PICKER_EXTRAS)
 
   $effect(() => {
     if (isOpen) {
       searchQuery = ''
       // Upstream parity (ComboFormModal fetchModalData): aliases drive
       // passthrough + custom-node rows; customs/disabled complete the merge.
-      api.getModelAliases().then((r) => (fetchedAliases = r?.aliases || {})).catch(() => {})
-      api.getCustomModels().then(normalizeCustoms).catch(() => {})
-      api.getDisabledModels().then(normalizeDisabled).catch(() => {})
+      // One batch, one write: three chained fetches each published their own
+      // $state and rebuilt the whole pill list on every settle (#61).
+      void loadPickerExtras(api).then((extras) => {
+        cachedPickerExtras = extras
+        fetchedExtras = extras
+      })
     }
   })
 
-  function normalizeCustoms(res: unknown) {
-    // Upstream parity: GET /api/models/custom -> { models: [...] }.
-    fetchedCustoms = parseCustomModelsResponse(res)
-  }
-
-  function normalizeDisabled(res: unknown) {
-    // Upstream parity: full-map { disabled: {...} } (ModelSelectModal) / bare map (go port).
-    fetchedDisabled = parseDisabledModelsMap(res)
-  }
-
   let groups = $derived(
     resolveModelPickerGroups(connections, providerNodes, {
-      modelAliases: modelAliases ?? fetchedAliases,
-      customModels: customModels ?? fetchedCustoms,
-      disabledModels: disabledModels ?? fetchedDisabled,
+      modelAliases: modelAliases ?? fetchedExtras.modelAliases,
+      customModels: customModels ?? fetchedExtras.customModels,
+      disabledModels: disabledModels ?? fetchedExtras.disabledModels,
+      deprecations: deprecations ?? fetchedExtras.deprecations,
     })
   )
   let filteredCombos = $derived(
     resolveFilteredCombos(combos, currentComboName, searchQuery, target)
   )
-  let filteredGroups = $derived(
-    resolveFilteredGroups(groups, searchQuery, target, addedModelValues)
-  )
+  let filteredGroups = $derived(resolveFilteredGroups(groups, searchQuery, target))
 
   function handleToggle(val: string) {
     if (addedModelValues.includes(val)) {
@@ -175,7 +174,7 @@
                   label={combo.name}
                   value={combo.name}
                   isAdded={addedModelValues.includes(combo.name)}
-                  onClick={() => handleToggle(combo.name)}
+                  onToggle={handleToggle}
                 />
               {/each}
             </div>
@@ -186,17 +185,13 @@
         {#each filteredGroups as group (group.id)}
           <div>
             <div class="flex items-center gap-1.5 mb-1.5 sticky top-0 bg-surface py-0.5 z-10">
-              <img
-                src={getIconPath(group.id)}
+              <ProviderArtwork
+                id={group.id}
                 alt={group.name}
-                class="w-3.5 h-3.5 object-contain rounded-sm"
-                loading="lazy"
-                onerror={(e) => {
-                  ;(e.currentTarget as HTMLImageElement).style.display = 'none'
-                }}
+                class="w-3.5 h-3.5 object-contain rounded-sm text-[9px] leading-none font-semibold"
               />
               <span class="text-xs font-medium text-brand-500">
-                {group.name}
+                {formatEmailLabel(group.name, $emailPrivacy)}
               </span>
               <span class="text-[10px] text-text-muted">
                 ({group.models.length})
@@ -208,8 +203,10 @@
                   label={model.name}
                   value={model.value}
                   isAdded={addedModelValues.includes(model.value)}
-                  caps={model.caps}
-                  onClick={() => handleToggle(model.value)}
+                  vision={model.caps.vision}
+                  reasoning={model.caps.reasoning}
+                  deprecated={model.deprecated}
+                  onToggle={handleToggle}
                 />
               {/each}
             </div>

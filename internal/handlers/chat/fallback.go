@@ -13,10 +13,12 @@ import (
 	"strings"
 	"time"
 
-	"9router/proxy/internal/db"
 	"9router/proxy/internal/handlerutil"
 	"9router/proxy/internal/log"
+	"9router/proxy/internal/middleware"
+	"9router/proxy/internal/observ"
 	"9router/proxy/internal/providers"
+	internalproxy "9router/proxy/internal/proxy"
 	"9router/proxy/internal/proxy/executor"
 	"9router/proxy/internal/tokensaver"
 	"9router/proxy/internal/tracing"
@@ -41,22 +43,25 @@ func (h *ChatHandler) handleAccountFallback(
 ) error {
 	body = repairToolCallIDsInJSON(body)
 	if pinnedConnectionID != "" {
-		connObj, connData, err := h.getBestConnection(provider, pinnedConnectionID, nil, model)
+		connObj, connData, err := h.getBestConnectionWithContext(ctx, provider, pinnedConnectionID, nil, model)
 		if err != nil {
 			return fmt.Errorf("pinned connection %s: %w", pinnedConnectionID, err)
 		}
 		log.Debug("fallback", "pinned", "pinnedConn", pinnedConnectionID, "connObj", connObj.ID)
 		return h.tryForwardWithConnection(forwardRequestParams{
 			Ctx: ctx, W: w, Provider: provider, Model: model,
-			ConnectionID: connObj.ID, ConnData: connData, Body: body,
+			ConnectionID: connObj.ID, ConnName: connObjName(connObj), ConnEmail: connObjEmail(connObj),
+			ConnData: connData, Body: body,
 			IsStream: isStream, TranslateResponse: translateResponse, Endpoint: endpoint,
 		})
 	}
 
-	if !h.Repo.IsProviderAvailable(provider, model) {
+	if !handlerutil.IsProbeContext(ctx) && !h.Repo.IsProviderAvailable(provider, model) {
 		log.Warn("fallback", "skip unhealthy", "provider", provider, "model", model)
 		return fmt.Errorf("provider %s/%s is unhealthy", provider, model)
 	}
+
+	observ.IncFallback(provider, model, observ.FallbackReasonUnhealthy)
 
 	allConns, err := h.Repo.GetProviderConnections(provider, true)
 	if err != nil || len(allConns) == 0 {
@@ -72,26 +77,14 @@ func (h *ChatHandler) handleAccountFallback(
 				IsStream: isStream, TranslateResponse: translateResponse, Endpoint: endpoint,
 			})
 		}
+		observ.IncFallback(provider, model, observ.FallbackReasonNoConnection)
 		return fmt.Errorf("no active connections for provider: %s", provider)
 	}
 
 	// Apply provider connection routing strategy (round-robin, sticky, random) if configured
 	if len(allConns) > 1 && h.Repo != nil {
 		if settings, sErr := h.Repo.GetSettings(); sErr == nil && settings != nil {
-			strat := db.ProviderStrategy{}
-			hasStrat := false
-			if settings.ProviderStrategies != nil {
-				if s, ok := settings.ProviderStrategies[provider]; ok {
-					strat = s
-					hasStrat = true
-				}
-			}
-			if !hasStrat || strat.RotateStrategy == "" {
-				if settings.FallbackStrategy != "" && settings.FallbackStrategy != "fill-first" {
-					strat.RotateStrategy = settings.FallbackStrategy
-					strat.StickyLimit = settings.StickyRoundRobinLimit
-				}
-			}
+			strat := connRotationStrategy(settings, provider)
 			if strat.RotateStrategy != "" && strat.RotateStrategy != "none" {
 				allConns = h.applyConnectionStrategy(allConns, strat)
 			}
@@ -104,8 +97,11 @@ func (h *ChatHandler) handleAccountFallback(
 		if slices.Contains(excludeIDs, c.ID) {
 			continue
 		}
-		connObj, connData, err := h.getBestConnection(provider, c.ID, nil, model)
+		connObj, connData, err := h.getBestConnectionWithContext(ctx, provider, c.ID, nil, model)
 		if err != nil || connObj == nil {
+			if lastErr == nil && err != nil {
+				lastErr = err
+			}
 			continue
 		}
 		apiKey := extractAPIKey(connData)
@@ -114,31 +110,51 @@ func (h *ChatHandler) handleAccountFallback(
 			if pErr == nil && providerCfg.DefaultAPIKey != "" {
 				apiKey = providerCfg.DefaultAPIKey
 			} else {
+				if lastErr == nil {
+					lastErr = fmt.Errorf("connection %s has no API key", connObj.ID)
+				}
 				continue
 			}
 		}
-		log.Debug("fallback", "connection", "conn", c.ID, "connObj", connObj.ID)
+		// connObj, not the loop candidate: a candidate in cooldown can resolve
+		// to a different account (force fallback), and the usage row, the logs
+		// and the exclusion below must all name the account that was dialled.
+		log.Debug("fallback", "connection", "conn", connObj.ID, "candidate", c.ID)
 		if err := h.tryForwardWithConnection(forwardRequestParams{
 			Ctx: ctx, W: w, Provider: provider, Model: model,
-			ConnectionID: c.ID, ConnData: connData, Body: body,
+			ConnectionID: connObj.ID, ConnName: connObjName(connObj), ConnEmail: connObjEmail(connObj),
+			ConnData: connData, Body: body,
 			IsStream: isStream, TranslateResponse: translateResponse, Endpoint: endpoint,
 		}); err == nil {
 			return nil
 		} else {
 			lastErr = err
+			observ.IncFallback(provider, model, observ.FallbackReasonUpstreamError)
 		}
 		var ue *upstreamError
+		if errors.As(lastErr, &ue) && providers.IsModelDeprecation(ue.StatusCode, ue.Body) {
+			// A retired model fails on every account of this provider, so the
+			// remaining connections are skipped and the badge the operator
+			// needs is recorded before the client sees the 410 (#179). The
+			// lastErr still returns when every account is out, so a direct
+			// request keeps reporting the upstream's own body.
+			h.recordModelDeprecation(ctx, provider, model, connObj.ID, ue)
+			excludeIDs = append(excludeIDs, connObj.ID)
+			lastErr = ue
+			continue
+		}
 		if errors.As(lastErr, &ue) && providers.RetryableStatusCodes[ue.StatusCode] {
+			if handlerutil.IsProbeContext(ctx) {
+				excludeIDs = append(excludeIDs, connObj.ID)
+				continue
+			}
 			// Extract error text from upstream body for classification
 			errorText := extractErrorText(ue.Body)
 			// Get current backoff level from this connection
 			currentBackoffLevel := h.Repo.GetConnectionBackoffLevel(connObj.ID)
 			// Classify error to get dynamic cooldown
 			classification := providers.ClassifyError(ue.StatusCode, errorText, currentBackoffLevel)
-			cooldownSec := int((classification.CooldownMs + 999) / 1000) // ceil to seconds
-			if dur, ok := extractResetDuration(ue.Body); ok {
-				cooldownSec = int(dur.Seconds())
-			}
+			cooldownSec := retryableCooldownSec(ue.StatusCode, time.Duration(classification.CooldownMs)*time.Millisecond, ue)
 			errMsg := errorText
 			if errMsg == "" {
 				errMsg = fmt.Sprintf("%d upstream error", ue.StatusCode)
@@ -150,16 +166,23 @@ func (h *ChatHandler) handleAccountFallback(
 			}
 			// Account-scoped cooldown alongside the per-model locks, so the
 			// selector can skip this account before spending a request
-			// (upstream applyErrorState).
-			until := time.Now().UTC().Add(time.Duration(cooldownSec) * time.Second)
-			if lockErr := h.Repo.LockConnectionRateLimit(connObj.ID, until, classification.NewBackoffLevel, ue.StatusCode, errorText); lockErr != nil {
-				log.Warn("fallback", "rate limit lock failed", "conn", connObj.ID, "error", lockErr)
+			// (upstream applyErrorState). Only lock if error is account-scoped,
+			// not model-scoped (e.g. 401 auth issues), so unrelated models stay available.
+			if isModelScopedError(ue.StatusCode, errorText, model) {
+				if recErr := h.Repo.RecordConnectionScopedError(connObj.ID, model, "chat", ue.StatusCode, errorText, classification.NewBackoffLevel); recErr != nil {
+					log.Warn("fallback", "record connection error failed", "conn", connObj.ID, "error", recErr)
+				}
+			} else {
+				until := time.Now().UTC().Add(time.Duration(cooldownSec) * time.Second)
+				if lockErr := h.Repo.LockConnectionRateLimit(connObj.ID, until, classification.NewBackoffLevel, ue.StatusCode, errorText); lockErr != nil {
+					log.Warn("fallback", "rate limit lock failed", "conn", connObj.ID, "error", lockErr)
+				}
 			}
 			log.Warn("fallback", "connection locked", append([]any{
 				"conn", connObj.ID, "provider", provider, "model", model,
 				"lockKey", lockKey, "status", ue.StatusCode, "cooldown_s", cooldownSec,
 			}, connIdentityKV(connObj)...)...)
-			excludeIDs = append(excludeIDs, c.ID)
+			excludeIDs = append(excludeIDs, connObj.ID)
 			continue
 		}
 		return lastErr
@@ -174,6 +197,12 @@ func (h *ChatHandler) handleAccountFallback(
 // isAnthropicUpstream reports whether the request is headed to Anthropic's
 // native Messages API (as opposed to an anthropic-compatible custom node).
 func isAnthropicUpstream(provider string, cfg *providers.ProviderConfig) bool {
+	if cfg == nil {
+		return false
+	}
+	if cfg.UpstreamIsAnthropic {
+		return true
+	}
 	if provider != "claude" && provider != "anthropic" {
 		return false
 	}
@@ -188,6 +217,19 @@ func isAnthropicUpstream(provider string, cfg *providers.ProviderConfig) bool {
 	}
 	return targetURL == "https://api.anthropic.com/v1/messages" ||
 		strings.HasPrefix(targetURL, "https://api.anthropic.com/v1/messages?")
+}
+
+// servesClaudeMessages reports whether the provider's own endpoint speaks
+// Anthropic Messages, so the body reaches it in Claude format and the reply
+// comes back Claude-shaped.
+//
+// That is a different question from isAnthropicUpstream: Anthropic's own API
+// additionally needs the beta query, the OAuth cloaking and the beta-flag
+// merge below, none of which a third-party Messages endpoint wants. A provider
+// declares the wire format on its registry entry (Format: "claude"), which is
+// the same field the /v1/models metadata publishes.
+func servesClaudeMessages(provider string, cfg *providers.ProviderConfig) bool {
+	return cfg != nil && cfg.Format == providers.FormatClaude
 }
 
 func appendBetaQuery(u string) string {
@@ -209,7 +251,13 @@ type forwardRequestParams struct {
 	W                 http.ResponseWriter
 	Provider          string
 	Model             string
+	RequestedModel    string
+	ComboName         string
+	Protocol          string
+	StartedAt         time.Time
 	ConnectionID      string
+	ConnName          string // human-readable account name, for logs
+	ConnEmail         string
 	ConnData          *ConnectionData
 	Body              []byte
 	IsStream          bool
@@ -292,16 +340,49 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 	// requests for non-Anthropic providers (DeepSeek, OpenAI-compatible) to
 	// OpenAI format before the fallback, and passing endpoint "/v1/v1/messages"
 	// alone would wrongly inject a top-level "system" the upstream ignores.
-	claudeNative := isAnthropic && (endpoint == "/v1/v1/messages" || endpoint == "/v1/messages")
-	pipedBody := h.applyTokenSavers(body, claudeNative)
+	//
+	// A /v1/messages client is only converted away from Claude format when the
+	// upstream cannot answer in it. That is true of two kinds of provider: one
+	// routing some of its models to a Messages endpoint (opencode-zen's Claude
+	// and Qwen lanes), and one whose own endpoint speaks Messages outright
+	// (minimax-code on MiniMax's mavis gateway). Both keep the client's own
+	// wire format end to end — upstream resolveTransport picks the
+	// sourceFormat-matched transport and skips translation.
+	messagesClient := endpoint == "/v1/v1/messages" || endpoint == "/v1/messages"
+	// A Messages-speaking provider answers a Messages client in its own wire
+	// format, whichever of the two ways it earns that: a model routed to a
+	// Messages endpoint (opencode-zen's Claude and Qwen lanes), or an endpoint
+	// that speaks Messages outright (minimax-code on the mavis gateway).
+	claudeNative := messagesClient && (isAnthropic ||
+		executor.ServesMessagesEndpoint(provider, model) ||
+		servesClaudeMessages(provider, providerCfg))
+
+	// upstreamClaude is what the executor needs to translate the Claude reply
+	// back for a Chat Completions client. Anthropic's own API and a third-party
+	// Messages endpoint both answer in Claude, but only Anthropic's wants the
+	// beta query, the OAuth cloaking and the beta-flag merge below.
+	upstreamClaude := isAnthropic || servesClaudeMessages(provider, providerCfg)
+	compressStart := time.Now()
+	pipedBody, origTokens, savedTokens, savedPct := h.applyTokenSavers(body, claudeNative)
+	compressDurMs := int(time.Since(compressStart).Milliseconds())
+	if compressDurMs <= 0 {
+		compressDurMs = 1
+	}
 	var claudeToolMap map[string]string
-	if isAnthropic {
+	if upstreamClaude {
 		if !claudeNative {
 			// Raw OpenAI-format body would be invalid at the Messages API:
 			// convert to a spec-compliant Claude payload (top-level system,
 			// tools, merged roles) — what the dashboard does server-side.
 			pipedBody = executor.EnsureClaudeMessages(pipedBody, model)
 		}
+		// The OpenAI→Claude conversion merges turns, so a client body whose
+		// last message was a tool result can still land on an assistant turn.
+		// A prefill is the client's own choice, so it is detected on the
+		// pre-conversion body (upstream ensureTrailingUserTurn, claude.js:345-349).
+		prefill := translator.ClaudeIntentionalPrefill(body)
+		pipedBody = translator.EnsureTrailingUserTurnBody(pipedBody, prefill)
+
 		// OAuth connections (or sk-ant-oat tokens) require Claude-Code-shaped requests:
 		// billing-header system block + metadata.user_id + cloaked tools,
 		// or the API 429s (anti-abuse fingerprinting).
@@ -361,6 +442,31 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 	} else if err != nil {
 		log.Warn("fallback", "sanitize failed", "provider", provider, "model", model, "error", err)
 	}
+	// DeepSeek answers 400 "Tool names must be unique" for a request that
+	// declares the same tool twice, so same-name definitions are collapsed at
+	// the last point before dispatch — after every conversion (OpenAI →
+	// Claude for an Anthropic upstream included), like upstream
+	// dedupeTools in open-sse/handlers/chatCore.js. Scoped by model id, so no
+	// other provider's tool array is touched.
+	if deduped := translator.DedupeToolsDeepSeek(pipedBody, model); len(deduped) != len(pipedBody) {
+		log.Debug("fallback", "deduped duplicate tool names", "provider", provider, "model", model)
+		pipedBody = deduped
+	}
+
+	// Fit tool names exceeding MaxToolNameLength (64 chars) to prevent upstream HTTP 400.
+	fittedBody, fittedToolMap := translator.FitToolNames(pipedBody)
+	if len(fittedToolMap) > 0 {
+		log.Debug("fallback", "fitted long tool names", "provider", provider, "model", model, "count", len(fittedToolMap))
+		pipedBody = fittedBody
+		w = executor.NewToolNameRestoringWriter(w, fittedToolMap)
+		ctx = translator.WithToolNameMap(ctx, fittedToolMap)
+		if claudeToolMap == nil {
+			claudeToolMap = make(map[string]string, len(fittedToolMap))
+		}
+		for k, v := range fittedToolMap {
+			claudeToolMap[k] = v
+		}
+	}
 	start := time.Now()
 	metrics := &streamMetrics{}
 	var fwdErr error
@@ -371,8 +477,98 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 		usagetracker.GetTracker().TrackPending(model, provider, connectionID, false, hasErr)
 	}()
 
-	httpClient := h.getClientForConnection(connData)
+	// A connection bound to a pool that cannot serve traffic must fail before
+	// anything is sent: the first request is the one that would otherwise
+	// escape from the real IP while the error only shows on the next attempt.
+	httpClient, clientErr := h.getClientForConnection(connData)
+	if clientErr != nil {
+		// Marshalled, not concatenated: the pool name is user-supplied and a
+		// quote in it produced a body that no longer parsed as JSON, so both
+		// the client and the diagnostics reader saw "request failed" instead
+		// of why the egress refused the request.
+		errBody, mErr := json.Marshal(map[string]any{
+			"error": map[string]string{"type": "proxy_error", "message": clientErr.Error()},
+		})
+		if mErr != nil {
+			errBody = []byte(`{"error":{"type":"proxy_error","message":"proxy pool unavailable"}}`)
+		}
+		fwdErr = &upstreamError{StatusCode: http.StatusBadGateway, Body: errBody}
+		// Failing closed on an unusable pool is a failed upstream attempt, and
+		// upstream records it: the same condition throws out of proxyFetch.js
+		// ("Proxy required but failed"), inside executor.execute, so chatCore.js
+		// catches it and writes both the requestDetails error row and the
+		// isError TrackPending. Assigning fwdErr before returning is also what
+		// makes the deferred TrackPending above report isError=true, which is
+		// how the topology card learns this provider failed.
+		connName, connEmail := identityNames(h.connIdentityKVOr(f, connectionID))
+		h.LogFailure(
+			&UsageLogInfo{
+				Provider:              provider,
+				Model:                 model,
+				ConnectionID:          connectionID,
+				ConnName:              connName,
+				ConnEmail:             connEmail,
+				Endpoint:              endpoint,
+				Egress:                resolveEgress(connData, providerCfg).LogValue(),
+				OriginalInputTokens:   origTokens,
+				SavedTokens:           savedTokens,
+				SavedPercent:          savedPct,
+				CompressionDurationMs: compressDurMs,
+			},
+			nil,
+			fwdErr,
+			time.Since(start).Milliseconds(),
+			body,
+			metrics,
+		)
+		log.Warn("fallback", "upstream blocked by proxy egress", "provider", provider, "model", model, "error", clientErr)
+		return fwdErr
+	}
+	// The client carries the strict-proxy marker itself, but the executors'
+	// DoRequest path sees only ctx, so the decision travels on both. A
+	// connection with nothing proxied at all is left unmarked: strict there
+	// means "never replay this request directly", not "a proxy must exist".
+	if connData != nil && (connData.ProxyPoolID != "" || connData.ConnectionProxyEnabled || connData.StrictProxy) {
+		ctx = internalproxy.WithStrictProxy(ctx, true)
+	}
 	sessionID := handlerutil.GetSessionID(ctx)
+
+	// The outbound guardrail tap goes here, not inside a response handler:
+	// this is the one point every dispatch path shares, so a provider with a
+	// registered executor is covered by exactly the same policy as one
+	// without. Placing it per handler left every executor-backed provider —
+	// which is most of the catalog — completely unfiltered, while the unit
+	// tests, which exercise a provider with no executor, still passed.
+	//
+	// The resolved policy goes on the context so the executors pick it up
+	// where they write, and a stream is tapped at the writer itself, because a
+	// buffered body could still be judged whole but a stream cannot be taken
+	// back once its first byte is out.
+	ctx = h.withOutboundPolicy(ctx)
+	gtapWriter, gtap := guardrailTap(ctx, w, endpoint, isStream)
+	if gtap != nil {
+		// Closed on the way out so the held window is discharged on the error
+		// paths below as well as the success one.
+		w = gtapWriter
+		defer gtap.Close()
+	}
+
+	// Hand the usage meter a way to reconcile the limiter's TPM reservation
+	// against what the turn actually cost.
+	//
+	// The reservation is read back off the context rather than recomputed: the
+	// limiter estimated from the body it had already read, and estimating twice
+	// from a body that may have been rewritten since would settle the charge
+	// against a number that was never charged.
+	if reserved, ok := middleware.ReservedTokensFromContext(ctx); ok && h.RateLimiter != nil {
+		if clientKey := requestKeyFromContext(ctx); clientKey != nil {
+			ctx = middleware.WithTokenSettler(ctx, func(actual int) {
+				if limit := middleware.EffectiveTPM(h.rateLimitDefaults(), clientKey); limit > 0 {
+					h.RateLimiter.SettleTokenUsage(clientKey.ID, limit, reserved, actual)
+				}
+			})
+		}
+	}
 
 	if exec := executor.Get(provider); exec != nil {
 		execReq := &executor.Request{
@@ -382,11 +578,12 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 			APIKey:         apiKey,
 			Body:           pipedBody,
 			IsStream:       isStream,
+			ClaudeClient:   endpoint == "/v1/v1/messages" || endpoint == "/v1/messages",
 			TranslateResp:  translateResponse,
 			ConnectionID:   connectionID,
 			SessionID:      sessionID,
 			ToolNameMap:    claudeToolMap,
-			UpstreamClaude: isAnthropic && !claudeNative,
+			UpstreamClaude: upstreamClaude && !claudeNative,
 			ResponseBuf:    &metrics.ResponseBuf,
 			StartTime:      start,
 			TTFT:           &metrics.TTFT,
@@ -403,10 +600,15 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 		}
 		fwdErr = exec(w, execReq)
 	} else if providerCfg.IsGeminiNative() {
-		fwdErr = h.forwardGeminiNativeRequest(ctx, w, provider, providerCfg, apiKey, connectionID, pipedBody, isStream, translateResponse, metrics)
+		fwdErr = h.forwardGeminiNativeRequest(ctx, w, provider, providerCfg, apiKey, connectionID, pipedBody, isStream, translateResponse, metrics, httpClient)
 	} else {
-		fwdErr = h.forwardRequest(ctx, w, providerCfg, apiKey, pipedBody, isStream, translateResponse, metrics)
+		fwdErr = h.forwardRequest(ctx, w, providerCfg, apiKey, pipedBody, isStream, translateResponse, metrics, httpClient)
 	}
+
+	// A tap that cut the stream must win over whatever the dispatch returned:
+	// the dispatch succeeded as far as it knew, so a blocked stream would
+	// otherwise be logged, billed, and cooled down as a served turn.
+	fwdErr = guardrailStreamOutcome(gtap, fwdErr)
 
 	var ue *upstreamError
 	if errors.As(fwdErr, &ue) && ue.StatusCode == http.StatusUnauthorized && connectionID != "" {
@@ -422,11 +624,12 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 					APIKey:         apiKey,
 					Body:           pipedBody,
 					IsStream:       isStream,
+					ClaudeClient:   endpoint == "/v1/v1/messages" || endpoint == "/v1/messages",
 					TranslateResp:  translateResponse,
 					ConnectionID:   connectionID,
 					SessionID:      sessionID,
 					ToolNameMap:    claudeToolMap,
-					UpstreamClaude: isAnthropic && !claudeNative,
+					UpstreamClaude: upstreamClaude && !claudeNative,
 					ResponseBuf:    &metrics.ResponseBuf,
 					StartTime:      start,
 					TTFT:           &metrics.TTFT,
@@ -442,9 +645,9 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 				}
 				fwdErr = exec(w, retryReq)
 			} else if providerCfg.IsGeminiNative() {
-				fwdErr = h.forwardGeminiNativeRequest(ctx, w, provider, providerCfg, apiKey, connectionID, pipedBody, isStream, translateResponse, metrics)
+				fwdErr = h.forwardGeminiNativeRequest(ctx, w, provider, providerCfg, apiKey, connectionID, pipedBody, isStream, translateResponse, metrics, httpClient)
 			} else {
-				fwdErr = h.forwardRequest(ctx, w, providerCfg, apiKey, pipedBody, isStream, translateResponse, metrics)
+				fwdErr = h.forwardRequest(ctx, w, providerCfg, apiKey, pipedBody, isStream, translateResponse, metrics, httpClient)
 			}
 		}
 	}
@@ -492,36 +695,68 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 
 	usage := translator.GetAndClearUsage(ctx)
 	if completed {
-		// Clear any existing model lock on success (matching Next.js clearAccountError).
-		lockKey := canonicalLockModel(provider, model)
-		if unlockErr := h.Repo.UnlockConnectionModel(connectionID, lockKey); unlockErr != nil {
-			log.Warn("fallback", "unlock failed", "provider", provider, "model", lockKey, "error", unlockErr)
-		}
-		if lockKey != model {
-			_ = h.Repo.UnlockConnectionModel(connectionID, model)
-		}
-		// A served request also clears the account-scoped cooldown, so an
-		// account that recovered is not kept out of rotation until the
-		// cooldown expires on its own.
-		if clearErr := h.Repo.ClearConnectionRateLimit(connectionID); clearErr != nil {
-			log.Warn("fallback", "rate limit clear failed", "conn", connectionID, "error", clearErr)
-		}
-		// A served request proves the account is usable again, so drop any
-		// cached quota block rather than leaving it to expire on its own.
-		if provider == "codex" {
-			ClearCodexQuotaBlock(connectionID)
+		if !handlerutil.IsProbeContext(ctx) {
+			// Clear any existing model lock on success (matching Next.js clearAccountError).
+			lockKey := canonicalLockModel(provider, model)
+			if unlockErr := h.Repo.UnlockConnectionModel(connectionID, lockKey); unlockErr != nil {
+				log.Warn("fallback", "unlock failed", "provider", provider, "model", lockKey, "error", unlockErr)
+			}
+			if lockKey != model {
+				_ = h.Repo.UnlockConnectionModel(connectionID, model)
+			}
+			// A served request also clears the account-scoped cooldown, so an
+			// account that recovered is not kept out of rotation until the
+			// cooldown expires on its own.
+			if clearErr := h.Repo.ClearConnectionRateLimit(connectionID); clearErr != nil {
+				log.Warn("fallback", "rate limit clear failed", "conn", connectionID, "error", clearErr)
+			}
+			// A served request proves the account is usable again, so drop any
+			// cached quota block rather than leaving it to expire on its own.
+			if provider == "codex" {
+				ClearCodexQuotaBlock(connectionID)
+			}
+			// A served request proves the model is alive, so a badge recorded by
+			// an earlier 410 must not outlive it (#179).
+			h.clearModelDeprecation(provider, model)
 		}
 		if usage == nil {
 			usage = &translator.OpenAIUsage{}
 		}
-		logInfo := &UsageLogInfo{
-			Provider:     provider,
-			Model:        model,
-			ConnectionID: connectionID,
-			APIKey:       apiKey,
-			Endpoint:     endpoint,
+		reqModel := f.RequestedModel
+		if reqModel == "" {
+			reqModel = translator.RequestedModelFromContext(ctx)
 		}
-		h.logUsage(logInfo, usage, latencyMs, body, metrics)
+		if reqModel == "" {
+			reqModel = model
+		}
+		protocol := f.Protocol
+		if protocol == "" {
+			protocol = resolveProtocol(endpoint)
+		}
+		startedAt := f.StartedAt
+		if startedAt.IsZero() {
+			startedAt = time.Now().Add(-time.Duration(latencyMs) * time.Millisecond)
+		}
+
+		logInfo := &UsageLogInfo{
+			Provider:              provider,
+			Model:                 model,
+			RequestedModel:        reqModel,
+			ComboName:             f.ComboName,
+			Protocol:              protocol,
+			CacheSource:           resolveCacheSource(usage),
+			StartedAt:             startedAt,
+			ConnectionID:          connectionID,
+			APIKey:                apiKey,
+			Endpoint:              endpoint,
+			Egress:                resolveEgress(connData, providerCfg).LogValue(),
+			OriginalInputTokens:   origTokens,
+			SavedTokens:           savedTokens,
+			SavedPercent:          savedPct,
+			CompressionDurationMs: compressDurMs,
+		}
+		logInfo.ConnName, logInfo.ConnEmail = identityNames(h.connIdentityKVOr(f, connectionID))
+		h.logUsage(ctx, logInfo, usage, latencyMs, body, metrics)
 		fwdErr = nil
 		return nil
 	}
@@ -533,12 +768,46 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 	if errors.As(fwdErr, &ue) {
 		statusCode = ue.StatusCode
 	}
+	identity := h.connIdentityKVOr(f, connectionID)
+	// Every failure line below carries the egress: a 401/429 from a provider
+	// that rate-limits by IP is only diagnosable if the log says whether the
+	// request actually left through the pool.
+	identity = append(identity, "egress", resolveEgress(connData, providerCfg).LogValue())
+	connName, connEmail := identityNames(identity)
+	reqModel := f.RequestedModel
+	if reqModel == "" {
+		reqModel = translator.RequestedModelFromContext(ctx)
+	}
+	if reqModel == "" {
+		reqModel = model
+	}
+	protocol := f.Protocol
+	if protocol == "" {
+		protocol = resolveProtocol(endpoint)
+	}
+	startedAt := f.StartedAt
+	if startedAt.IsZero() {
+		startedAt = time.Now().Add(-time.Duration(latencyMs) * time.Millisecond)
+	}
+
 	h.LogFailure(
 		&UsageLogInfo{
-			Provider:     provider,
-			Model:        model,
-			ConnectionID: connectionID,
-			Endpoint:     endpoint,
+			Provider:              provider,
+			Model:                 model,
+			RequestedModel:        reqModel,
+			ComboName:             f.ComboName,
+			Protocol:              protocol,
+			StartedAt:             startedAt,
+			ConnectionID:          connectionID,
+			ConnName:              connName,
+			ConnEmail:             connEmail,
+			APIKey:                apiKey,
+			Endpoint:              endpoint,
+			Egress:                resolveEgress(connData, providerCfg).LogValue(),
+			OriginalInputTokens:   origTokens,
+			SavedTokens:           savedTokens,
+			SavedPercent:          savedPct,
+			CompressionDurationMs: compressDurMs,
 		},
 		usage,
 		fwdErr,
@@ -547,15 +816,21 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 		metrics,
 	)
 	if isClientCanceled(ctx, fwdErr) {
-		log.Info("fallback", "client canceled request", "provider", provider, "model", model, "conn", connectionID)
+		log.Info("fallback", "client canceled request", append([]any{
+			"provider", provider, "model", model,
+		}, identity...)...)
 	} else if projectProbeCached(connectionID) {
-		log.Debug("fallback", "upstream skipped (cached no-project)", "provider", provider, "model", model, "conn", connectionID, "error", fwdErr)
+		log.Debug("fallback", "upstream skipped (cached no-project)", append([]any{
+			"provider", provider, "model", model, "error", fwdErr,
+		}, identity...)...)
 	} else {
 		log.Warn("fallback", "upstream failed", append([]any{
-			"provider", provider, "model", model, "conn", connectionID,
+			"provider", provider, "model", model,
 			"status", statusCode, "error", fwdErr,
-		}, h.connIdentityKVByID(connectionID)...)...)
+		}, identity...)...)
 	}
+
+	observ.IncUpstreamError(provider, model, statusCode)
 	return fwdErr
 }
 func isClientCanceled(ctx context.Context, err error) bool {
@@ -577,7 +852,10 @@ func isClientCanceled(ctx context.Context, err error) bool {
 // /v1/messages): system prompts must go to the top-level "system" field —
 // a role:"system" message is rejected by the Anthropic API.
 // false from compress/inject means nothing changed (or unparseable) — keep original, not a failure.
-func (h *ChatHandler) applyTokenSavers(body []byte, claudeNative bool) []byte {
+func (h *ChatHandler) applyTokenSavers(body []byte, claudeNative bool) ([]byte, int, int, int) {
+	if h.TokenSaver == nil {
+		return body, 0, 0, 0
+	}
 	// Prompt-injection guard: tag (never block) flagged user content. Early
 	// detection here means operators can see abuse before it reaches upstream.
 	// Toggle via settings.injectionGuardEnabled (off bypasses the scan).
@@ -587,8 +865,28 @@ func (h *ChatHandler) applyTokenSavers(body []byte, claudeNative bool) []byte {
 		}
 	}
 	out := body
+	var origTokens, savedTokens, savedPct int
 	if h.TokenSaver.RTKEnabled() {
-		if next, did := tokensaver.CompressMessages(out); did {
+		rtkCfg := h.TokenSaver.RTKConfig()
+		if next, did := tokensaver.CompressMessagesWithConfig(out, rtkCfg); did {
+			origTokens = len(out) / 4
+			compressedTokens := len(next) / 4
+			savedTokens = origTokens - compressedTokens
+			savedPct = 0
+			if origTokens > 0 {
+				savedPct = (savedTokens * 100) / origTokens
+			}
+			log.Info("token_saver", "RTK compressed tool output",
+				"orig_est", origTokens,
+				"compressed_est", compressedTokens,
+				"saved_est", savedTokens,
+				"saved_pct", fmt.Sprintf("%d%%", savedPct),
+			)
+			out = next
+		}
+	}
+	if h.TokenSaver.CavemanInputMode() {
+		if next, did := tokensaver.CompressInputMessages(out, h.TokenSaver.CavemanPreserveKeywords()); did {
 			out = next
 		}
 	}
@@ -597,9 +895,15 @@ func (h *ChatHandler) applyTokenSavers(body []byte, claudeNative bool) []byte {
 		inject = tokensaver.InjectSystemPromptClaude
 	}
 	if h.TokenSaver.CavemanEnabled() {
-		prompt := tokensaver.GetCavemanPrompt(h.TokenSaver.CavemanLevel())
-		if next, did := inject(out, prompt); did {
-			out = next
+		bypass := false
+		if h.TokenSaver.CavemanAutoClarity() && tokensaver.ShouldBypassCaveman(out) {
+			bypass = true
+		}
+		if !bypass {
+			prompt := tokensaver.GetCavemanPromptWithLang(h.TokenSaver.CavemanLevel(), h.TokenSaver.CavemanLanguage())
+			if next, did := inject(out, prompt); did {
+				out = next
+			}
 		}
 	}
 	if h.TokenSaver.PonytailEnabled() {
@@ -608,7 +912,30 @@ func (h *ChatHandler) applyTokenSavers(body []byte, claudeNative bool) []byte {
 			out = next
 		}
 	}
-	return out
+	if h.TokenSaver.ADHDEnabled() {
+		prompt := tokensaver.GetADHDPrompt(h.TokenSaver.ADHDLevel())
+		if next, did := inject(out, prompt); did {
+			out = next
+		}
+	}
+	return out, origTokens, savedTokens, savedPct
+}
+
+func resolveProtocol(endpoint string) string {
+	if endpoint == "/v1/messages" {
+		return "Claude-Messages"
+	}
+	if strings.Contains(endpoint, "gemini") {
+		return "Gemini"
+	}
+	return "OpenAI-Chat"
+}
+
+func resolveCacheSource(u *translator.OpenAIUsage) string {
+	if u != nil && (u.CachedTokens > 0 || (u.PromptTokensDetails != nil && u.PromptTokensDetails.CachedTokens > 0)) {
+		return "Upstream (Provider)"
+	}
+	return "None"
 }
 
 // extractErrorText attempts to extract a human-readable error message from an upstream error JSON body.
@@ -773,11 +1100,14 @@ func formatRetryAfter(isoTimestamp string) string {
 	if err != nil {
 		return ""
 	}
-	diffMs := time.Until(parsed)
-	if diffMs <= 0 {
+	// time.Until is a Duration in nanoseconds. Dividing by 1000 yielded
+	// milliseconds, so a 150s cooldown read as "reset after 41399h" and
+	// contradicted the Retry-After header sent alongside it.
+	remaining := time.Until(parsed)
+	if remaining <= 0 {
 		return "reset after 0s"
 	}
-	totalSec := int((diffMs + 999) / 1000) // ceil
+	totalSec := int((remaining + time.Second - 1) / time.Second) // ceil
 	h := totalSec / 3600
 	m := (totalSec % 3600) / 60
 	s := totalSec % 60
@@ -807,4 +1137,83 @@ func claudeSessionIDFromBody(body []byte) string {
 	}
 	userID, _ := meta["user_id"].(string)
 	return extractClaudeSessionIdFromUserId(userID)
+}
+
+func isAccountAuthFailure(lower string) bool {
+	return strings.Contains(lower, "no credentials") ||
+		strings.Contains(lower, "invalid_grant") ||
+		strings.Contains(lower, "invalid token") ||
+		strings.Contains(lower, "token type is not supported") ||
+		strings.Contains(lower, "authentication expired") ||
+		strings.Contains(lower, "token expired") ||
+		strings.Contains(lower, "account suspended") ||
+		strings.Contains(lower, "account disabled") ||
+		strings.Contains(lower, "incorrect api key") ||
+		strings.Contains(lower, "invalid api key") ||
+		strings.Contains(lower, "organization is not supported") ||
+		strings.Contains(lower, "insufficient funds for organization")
+}
+
+func isModelQuotaText(errorText string) bool {
+	upper := strings.ToUpper(errorText)
+	return strings.Contains(upper, "QUOTA_EXHAUSTED") ||
+		strings.Contains(errorText, "Individual quota reached") ||
+		strings.Contains(upper, "MODEL_CAPACITY_EXHAUSTED")
+}
+
+func mentionsGate(lower string) bool {
+	return strings.Contains(lower, "is not supported") ||
+		strings.Contains(lower, "not supported") ||
+		strings.Contains(lower, "model access is disabled") ||
+		strings.Contains(lower, "endpoint is unavailable")
+}
+
+// isModelScopedError reports whether an upstream retryable error is
+// specific to the requested model (e.g. 429 model quota, 402 insufficient funds
+// for paid models, or 401 "model is not supported") rather than an account-scoped
+// credential failure. For model-scoped errors, only LockConnectionModel and
+// RecordConnectionError are set so that unrelated healthy models on the same account
+// remain available.
+func isModelScopedError(statusCode int, errorText string, model string) bool {
+	if model == "" {
+		return false
+	}
+	lower := strings.ToLower(errorText)
+	if isAccountAuthFailure(lower) {
+		return false
+	}
+
+	// 1. Quota exhaustion markers (Antigravity Claude, etc.) on 429/403/503
+	if statusCode == http.StatusTooManyRequests || statusCode == http.StatusForbidden || statusCode == http.StatusServiceUnavailable {
+		if isModelQuotaText(errorText) {
+			return true
+		}
+	}
+
+	// 2. Model-gate verdicts only ever arrive on 400/401/402/403.
+	// A 5xx that merely says "not supported" is a node fault, not a model gate.
+	switch statusCode {
+	case http.StatusBadRequest, http.StatusUnauthorized, http.StatusPaymentRequired, http.StatusForbidden:
+	default:
+		return false
+	}
+
+	// 402 Insufficient account funds on providers serving tiered models (e.g. Zen paid models)
+	if statusCode == http.StatusPaymentRequired {
+		if (strings.Contains(lower, "insufficient account funds") || strings.Contains(lower, "insufficient funds")) &&
+			!strings.Contains(lower, "credits are exhausted") && !strings.Contains(lower, "spending limit") {
+			return true
+		}
+	}
+
+	// 401/400/403: Body must name the requested model AND mention that the model is unsupported/disabled
+	cleanModel := strings.ToLower(model)
+	if idx := strings.LastIndex(cleanModel, "/"); idx != -1 {
+		cleanModel = cleanModel[idx+1:]
+	}
+	if (strings.Contains(lower, cleanModel) || strings.Contains(lower, strings.ToLower(model))) && mentionsGate(lower) {
+		return true
+	}
+
+	return false
 }

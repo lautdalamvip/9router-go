@@ -7,7 +7,6 @@
     Download,
     Eye,
     EyeOff,
-    Globe,
     Key,
     Laptop,
     Loader2,
@@ -40,13 +39,13 @@
   // General Settings State
   let requireLogin = $state(false)
   let sessionTimeout = $state('24h')
-  let selectedLanguage = $state('en')
   let enableObservability = $state(false)
 
   // Routing Strategy State
   let fallbackStrategy = $state('failover')
   let stickyRoundRobinLimit = $state(3)
   let comboStrategy = $state('first-model')
+  let forceFallback = $state(false)
 
   // Password Management State
   let currentPassword = $state('')
@@ -86,10 +85,10 @@
       requireLogin = !!settings.requireLogin
       enableObservability = !!settings.enableObservability
       if (typeof settings.sessionTimeout === 'string') sessionTimeout = settings.sessionTimeout
-      if (typeof settings.language === 'string') selectedLanguage = settings.language
       if (typeof settings.fallbackStrategy === 'string') fallbackStrategy = settings.fallbackStrategy
       if (typeof settings.stickyRoundRobinLimit === 'number') stickyRoundRobinLimit = settings.stickyRoundRobinLimit
       if (typeof settings.comboStrategy === 'string') comboStrategy = settings.comboStrategy
+      if (typeof settings.forceFallback === 'boolean') forceFallback = settings.forceFallback
 
       // SSO
       if (settings.authMode === 'oidc' || settings.authMode === 'saml') authMode = settings.authMode
@@ -112,10 +111,10 @@
         requireLogin = !!s.requireLogin
         enableObservability = !!s.enableObservability
         if (s.sessionTimeout) sessionTimeout = String(s.sessionTimeout)
-        if (s.language) selectedLanguage = String(s.language)
         if (s.fallbackStrategy) fallbackStrategy = String(s.fallbackStrategy)
         if (typeof s.stickyRoundRobinLimit === 'number') stickyRoundRobinLimit = s.stickyRoundRobinLimit
         if (s.comboStrategy) comboStrategy = String(s.comboStrategy)
+        if (typeof s.forceFallback === 'boolean') forceFallback = s.forceFallback
 
         if (s.authMode === 'oidc' || s.authMode === 'saml') authMode = s.authMode
         if (s.oidcIssuerUrl) oidcIssuerUrl = String(s.oidcIssuerUrl)
@@ -144,11 +143,11 @@
       await api.updateSettings({
         requireLogin,
         sessionTimeout,
-        language: selectedLanguage,
         enableObservability,
         fallbackStrategy,
         stickyRoundRobinLimit,
         comboStrategy,
+        forceFallback,
         authMode,
         oidcIssuerUrl,
         oidcClientId,
@@ -229,16 +228,9 @@
         headers: { ...getAuthHeaders(), 'x-9r-password': password },
       })
       if (!res.ok) {
-        // This route is always-protected, so the middleware answers a
-        // sessionless request with the nested {"error":{...}} envelope rather
-        // than the handler's flat {"error":"..."}. responseErrorMessage unwraps
-        // both; reading `data.error` alone stringifies the envelope to
-        // "[object Object]".
         throw new Error(await responseErrorMessage(res, 'Failed to export database'))
       }
-      const payload = await res.json()
-      const content = JSON.stringify(payload, null, 2)
-      const blob = new Blob([content], { type: 'application/json' })
+      const blob = await res.blob()
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
       const stamp = new Date().toISOString().replace(/[.:]/g, '-')
@@ -246,8 +238,10 @@
       a.download = `9router-backup-${stamp}.json`
       document.body.appendChild(a)
       a.click()
-      document.body.removeChild(a)
-      URL.revokeObjectURL(url)
+      setTimeout(() => {
+        document.body.removeChild(a)
+        URL.revokeObjectURL(url)
+      }, 1000)
     } catch (err) {
       alert(`Failed to download backup: ${err instanceof Error ? err.message : String(err)}`)
     } finally {
@@ -278,18 +272,27 @@
     const password = dbPassword
     isImportingBackup = true
     try {
-      const raw = await file.text()
-      const payload = JSON.parse(raw)
-
-      const res = await fetch('/api/settings/database', {
-        method: 'POST',
-        headers: { ...getAuthHeaders(), 'x-9r-password': password },
-        body: JSON.stringify(payload),
-      })
+      let res: Response
+      const isZip = file.name.endsWith('.zip') || file.type === 'application/zip'
+      if (isZip) {
+        const buffer = await file.arrayBuffer()
+        res = await fetch('/api/settings/database', {
+          method: 'POST',
+          headers: { ...getAuthHeaders(), 'x-9r-password': password, 'Content-Type': 'application/zip' },
+          body: buffer,
+        })
+      } else {
+        const raw = await file.text()
+        const payload = JSON.parse(raw)
+        res = await fetch('/api/settings/database', {
+          method: 'POST',
+          headers: { ...getAuthHeaders(), 'x-9r-password': password, 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        })
+      }
       if (!res.ok) {
         throw new Error(await responseErrorMessage(res, 'Failed to import database'))
       }
-
       alert('Database backup imported successfully! Reloading page...')
       window.location.reload()
     } catch (err) {
@@ -386,7 +389,7 @@
 
           <input
             type="file"
-            accept=".json"
+            accept=".zip,.json,application/zip,application/json"
             bind:this={fileInput}
             onchange={handleFileSelected}
             class="hidden"
@@ -405,37 +408,7 @@
       </div>
     </Card>
 
-    <!-- SECTION 2: Language & Region -->
-    <Card padding="md" class="space-y-4">
-      <div class="flex items-center gap-2 pb-2 border-b border-border">
-        <Globe class="w-4 h-4 text-brand-500" />
-        <h2 class="text-sm font-bold text-text-main">Language & Display</h2>
-      </div>
-
-      <div class="space-y-3 text-xs">
-        <div class="space-y-1">
-          <label for="lang-select" class="block font-semibold text-text-main">Dashboard Language</label>
-          <select
-            id="lang-select"
-            bind:value={selectedLanguage}
-            class="w-full px-3 py-2 rounded-lg bg-bg border border-border text-xs text-text-main focus:outline-none focus:border-brand-500"
-          >
-            <option value="en">English (US)</option>
-            <option value="zh-CN">简体中文 (Simplified Chinese)</option>
-            <option value="zh-TW">繁體中文 (Traditional Chinese)</option>
-            <option value="ja">日本語 (Japanese)</option>
-            <option value="ko">한국어 (Korean)</option>
-            <option value="es">Español</option>
-            <option value="de">Deutsch</option>
-          </select>
-          <p class="text-[11px] text-text-subtle">
-            Select the primary interface language for the 9router-go web dashboard.
-          </p>
-        </div>
-      </div>
-    </Card>
-
-    <!-- SECTION 3: Security & Master Password -->
+    <!-- SECTION 2: Security & Master Password -->
     <Card padding="md" class="space-y-4">
       <div class="flex items-center justify-between pb-2 border-b border-border">
         <div class="flex items-center gap-2">
@@ -486,7 +459,7 @@
           {#if showPasswordFields}
             <form onsubmit={handleUpdatePassword} class="space-y-2.5 pt-3">
               {#if passwordErrorMessage}
-                <div class="p-2.5 rounded-lg bg-danger/10 border border-danger/20 text-danger text-[11px]">
+                <div class="p-2.5 rounded-lg bg-danger/10 border border-danger/20 text-red-600 dark:text-red-400 text-[11px]">
                   {passwordErrorMessage}
                 </div>
               {/if}
@@ -545,7 +518,7 @@
       </div>
     </Card>
 
-    <!-- SECTION 4: Single Sign-On (SSO) -->
+    <!-- SECTION 3: Single Sign-On (SSO) -->
     <Card padding="md" class="space-y-4">
       <div class="flex items-center justify-between pb-2 border-b border-border">
         <div class="flex items-center gap-2">
@@ -638,7 +611,7 @@
       </div>
     </Card>
 
-    <!-- SECTION 5: Routing Strategy & Limits -->
+    <!-- SECTION 4: Routing Strategy & Limits -->
     <Card padding="md" class="space-y-4">
       <div class="flex items-center gap-2 pb-2 border-b border-border">
         <Sliders class="w-4 h-4 text-brand-500" />
@@ -687,10 +660,22 @@
             <option value="round-robin">Round Robin (Rotate starting model)</option>
           </select>
         </div>
+
+        <Toggle
+          checked={forceFallback}
+          size="sm"
+          label="Force Fallback (all accounts cooling down)"
+          onChange={(v: boolean) => (forceFallback = v)}
+        />
+        <p class="text-[11px] text-text-subtle">
+          When every account is in cooldown, send the request through the account that
+          frees up first instead of failing. Requests can still be rejected upstream.
+        </p>
+
       </div>
     </Card>
 
-    <!-- SECTION 6: Observability & Tracing -->
+    <!-- SECTION 5: Observability & Tracing -->
     <Card padding="md" class="space-y-4">
       <div class="flex items-center justify-between pb-2 border-b border-border">
         <div class="flex items-center gap-2">
@@ -726,7 +711,7 @@
         <p class="text-text-muted">
           {pendingImportFile
             ? `Import "${pendingImportFile.name}"? This will overwrite existing server data.`
-            : 'Download a full backup of the dashboard database?'}
+            : 'Download a full backup of the dashboard database (.json file)?'}
         </p>
         <Input
           type="password"

@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"9router/proxy/internal/providers"
 	"9router/proxy/internal/proxy"
 )
 
@@ -84,11 +85,15 @@ func fetchProviderUsage(ctx context.Context, provider string, data map[string]an
 	case "codebuddy-intl":
 		return fetchCodeBuddyIntlUsage(ctx, accessToken, apiKey), true
 	case "kiro":
-		return fetchKiroUsage(ctx, accessToken, psd), true
+		return fetchKiroUsage(ctx, kiroUsageToken(accessToken, apiKey, psd), psd), true
 	case "grok-cli":
 		return fetchGrokCliUsage(ctx, accessToken, psd), true
 	case "codex":
 		return fetchCodexUsage(ctx, firstNonEmptyStr(accessToken, apiKey)), true
+	case "opencode-zen":
+		return fetchOpenCodeZenUsage(ctx, apiKey, connectionBaseURL(data)), true
+	case "minimax-code", "minimax-code-global":
+		return fetchMiniMaxCodeUsage(ctx, provider, accessToken, psdStr(psd, "realUserID")), true
 	default:
 		return usageResult{}, false
 	}
@@ -105,11 +110,45 @@ func usageCreds(data map[string]any) (accessToken, apiKey string, psd map[string
 	return accessToken, apiKey, map[string]any{}
 }
 
+// kiroUsageToken mirrors resolveProviderAuthToken in internal/handlers/chat, which
+// picks the credential the chat path sends. Keeping the same precedence here is
+// what stops the quota tracker from sending an empty bearer for a connection whose
+// chat traffic works: a Kiro connection stores its credential in apiKey, and
+// passing only accessToken produced "Kiro quota API rejected the current token"
+// while chat succeeded with the very credential the quota read never looked at.
+func kiroUsageToken(accessToken, apiKey string, psd map[string]any) string {
+	authMethod, _ := psd["authMethod"].(string)
+	if authMethod == "api_key" && apiKey != "" {
+		return apiKey
+	}
+	if accessToken != "" {
+		return accessToken
+	}
+	return apiKey
+}
+
 func psdStr(psd map[string]any, keys ...string) string {
 	for _, k := range keys {
 		if v, ok := psd[k].(string); ok && strings.TrimSpace(v) != "" {
 			return strings.TrimSpace(v)
 		}
+	}
+	return ""
+}
+
+// connectionBaseURL reports the endpoint a connection actually dials. The chat
+// path reads it from ConnectionData.BaseURL, which is hydrated from either the
+// top-level baseUrl or providerSpecificData.baseUrl depending on how the
+// connection was written.
+func connectionBaseURL(data map[string]any) string {
+	if data == nil {
+		return ""
+	}
+	if v := usageStr(data["baseUrl"]); v != "" {
+		return v
+	}
+	if psd, ok := data["providerSpecificData"].(map[string]any); ok {
+		return usageStr(psd["baseUrl"])
 	}
 	return ""
 }
@@ -1057,6 +1096,12 @@ func resetAtStr(s string) any {
 }
 
 func fetchKiroUsage(ctx context.Context, accessToken string, psd map[string]any) usageResult {
+	// Without a credential every attempt sends an empty bearer and comes back as
+	// an auth rejection, which reads as "your token expired" when the real
+	// problem is that the connection was saved without one.
+	if strings.TrimSpace(accessToken) == "" {
+		return usageResult{message: "No Kiro credential is stored for this connection.", quotas: map[string]any{}}
+	}
 	authMethod, _ := psd["authMethod"].(string)
 	if authMethod == "" {
 		authMethod = "builder-id"
@@ -1172,9 +1217,9 @@ func fetchKiroUsage(ctx context.Context, accessToken string, psd map[string]any)
 // ---------- grok-cli: billing + user ----------
 
 const (
-	grokCliVersion          = "0.2.99"
-	grokCliClientIdentifier = "grok-shell"
-	grokCliUserAgent        = "grok-shell/0.2.99 (linux; x86_64)"
+	grokCliVersion          = providers.GrokCLIVersion
+	grokCliClientIdentifier = providers.GrokCLIClientIdentifier
+	grokCliUserAgent        = providers.GrokCLIUserAgent
 	grokCliBillingURL       = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
 	grokCliUserURL          = "https://cli-chat-proxy.grok.com/v1/user?include=subscription"
 )
@@ -1497,8 +1542,10 @@ var antigravityImportantModels = map[string]bool{
 	"gemini-3.8-flash-high": true, "gemini-3.8-flash-medium": true, "gemini-3.8-flash-low": true,
 	"gemini-3.7-flash-high": true, "gemini-3.7-flash-medium": true, "gemini-3.7-flash-low": true,
 	"gemini-3.6-flash-high": true, "gemini-3.6-flash-medium": true, "gemini-3.6-flash-low": true,
-	"gemini-3.5-flash-low": true, "gemini-3.5-flash-extra-low": true,
-	"gemini-pro-agent": true, "gemini-3.1-pro-low": true,
+	"gemini-3.1-pro-high": true, "gemini-pro-agent": true, "gemini-3.1-pro-low": true,
+	"claude-sonnet-5-5-high": true, "claude-sonnet-5-5-medium": true, "claude-sonnet-5-5-low": true,
+	"claude-sonnet-5-5": true, "claude-opus-5-5-high": true, "claude-opus-5-5-medium": true,
+	"claude-opus-5-5-low": true, "claude-opus-5-5": true,
 	"claude-sonnet-4-6": true, "claude-opus-4-6-thinking": true,
 	"gpt-oss-120b-medium":    true,
 	"gemini-3.1-flash-image": true,

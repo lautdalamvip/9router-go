@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"9router/proxy/internal/handlers/chat"
+	"9router/proxy/internal/handlerutil"
 	"9router/proxy/internal/log"
 	"9router/proxy/internal/models"
 	"9router/proxy/internal/providers"
@@ -56,7 +57,7 @@ func (h *MediaHandler) handleAntigravityImage(w http.ResponseWriter, r *http.Req
 	excludeIDs := []string{}
 	var lastErr error
 	for {
-		conn, connData, err := h.ChatH.GetBestConnection("antigravity", pinned, excludeIDs, cleanModel)
+		conn, connData, err := h.ChatH.GetBestConnectionWithContext(r.Context(), "antigravity", pinned, excludeIDs, cleanModel)
 		if err != nil || conn == nil {
 			if lastErr != nil {
 				return lastErr
@@ -167,7 +168,10 @@ func (h *MediaHandler) tryAntigravityImageConn(w http.ResponseWriter, r *http.Re
 	httpReq.Header.Set("X-Client-Name", "antigravity")
 	httpReq.Header.Set("X-Client-Version", "2.11.0")
 
-	client := h.ChatH.GetClientForConnection(connData)
+	client, clientErr := h.ChatH.GetClientForConnection(connData)
+	if clientErr != nil {
+		return clientErr
+	}
 	resp, err := client.Do(httpReq)
 	if err != nil {
 		return fmt.Errorf("antigravity request failed: %w", err)
@@ -184,6 +188,7 @@ func (h *MediaHandler) tryAntigravityImageConn(w http.ResponseWriter, r *http.Re
 		log.Warn("media", "antigravity image error", "status", resp.StatusCode, "body", errText)
 		if h.Repo != nil {
 			backoff := h.Repo.GetConnectionBackoffLevel(conn.ID)
+		if !handlerutil.IsProbeContext(r.Context()) {
 			if classification := providers.ClassifyError(resp.StatusCode, errText, backoff); classification.ShouldFallback {
 				cooldownSec := max(classification.CooldownMs/1000, 1)
 				_ = h.Repo.LockConnectionModel(conn.ID, cleanModel, cooldownSec, classification.NewBackoffLevel)
@@ -199,6 +204,7 @@ func (h *MediaHandler) tryAntigravityImageConn(w http.ResponseWriter, r *http.Re
 				}
 			}
 		}
+		}
 		return fmt.Errorf("antigravity image failed with status %d: %s", resp.StatusCode, string(respBody[:min(300, len(respBody))]))
 	}
 
@@ -213,7 +219,11 @@ func (h *MediaHandler) tryAntigravityImageConn(w http.ResponseWriter, r *http.Re
 
 	if h.Repo != nil {
 		h.Repo.UpdateConnectionLastUsed(conn.ID)
-		_ = h.Repo.UnlockConnectionModel(conn.ID, cleanModel)
+		// Probes read production state; they never clear it (see
+		// tts_forward.go for the same reasoning on the failure path).
+		if !handlerutil.IsProbeContext(r.Context()) {
+			_ = h.Repo.UnlockConnectionModel(conn.ID, cleanModel)
+		}
 	}
 	usagetracker.GetTracker().PushRecent(usagetracker.RecentRequest{
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
