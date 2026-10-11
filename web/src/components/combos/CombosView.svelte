@@ -306,6 +306,46 @@
 
   let bulkStrategy = $state('')
 
+  // One-click auto builders. Both upsert stable ids, so clicking again
+  // refreshes the generated combos instead of stacking duplicates. The
+  // optimal builder is the "I do not want to hand-build combos" path: it
+  // writes one combo per model family plus a master "Auto: Optimal" chain.
+  let isBuildingAutoOptimal = $state(false)
+  let isBuildingAutoFree = $state(false)
+
+  async function handleBuildAutoOptimal() {
+    isBuildingAutoOptimal = true
+    try {
+      const res = await api.buildAutoOptimalCombos()
+      const familyCount = res.families?.length ?? 0
+      const cap = res.truncated ? ' The master chain was capped at 50 models.' : ''
+      alert(
+        `Built ${familyCount} per-family combo(s) plus “Auto: Optimal” with ${res.count} model(s).` +
+          cap
+      )
+      onRefresh()
+    } catch (e) {
+      alert('Failed to build optimal combos: ' + (e instanceof Error ? e.message : String(e)))
+    } finally {
+      isBuildingAutoOptimal = false
+    }
+  }
+
+  async function handleBuildAutoFree() {
+    isBuildingAutoFree = true
+    try {
+      const res = await api.buildAutoFreeCombo()
+      onRefresh()
+      if (res.models.length === 0) {
+        alert('No free-tier models found among providers you have connections for.')
+      }
+    } catch (e) {
+      alert('Failed to build auto free-tier combo: ' + (e instanceof Error ? e.message : String(e)))
+    } finally {
+      isBuildingAutoFree = false
+    }
+  }
+
   // Upstream writes the strategy through the same settings patch a single card
   // uses, then one updateCombo per row: comboStrategies is keyed by combo NAME,
   // so it has to be rewritten as a whole or the last write wins.
@@ -339,7 +379,13 @@
 </script>
 
 <div class="flex min-w-0 flex-col gap-6 px-1 sm:px-0">
-  <CombosHeader onCreateClick={openCreateModal} />
+  <CombosHeader
+    onCreateClick={openCreateModal}
+    onAutoOptimalClick={handleBuildAutoOptimal}
+    {isBuildingAutoOptimal}
+    onAutoFreeClick={handleBuildAutoFree}
+    {isBuildingAutoFree}
+  />
 
   <!-- Upstream selection bar: the count is on the checkbox, and the bulk
        actions only exist while something is selected, so the destructive
@@ -408,9 +454,20 @@
         </div>
         <p class="text-text-main font-medium mb-1">No combos yet</p>
         <p class="text-sm text-text-muted mb-4">Create model combos with fallback support</p>
-        <Button icon="add" onclick={openCreateModal} class="w-full sm:w-auto">
-          Create Combo
-        </Button>
+        <div class="flex flex-col items-center justify-center gap-2 sm:flex-row">
+          <Button
+            icon="auto_awesome"
+            variant="outline"
+            onclick={handleBuildAutoOptimal}
+            disabled={isBuildingAutoOptimal}
+            class="w-full sm:w-auto"
+          >
+            {isBuildingAutoOptimal ? 'Building…' : 'Auto Optimal'}
+          </Button>
+          <Button icon="add" onclick={openCreateModal} class="w-full sm:w-auto">
+            Create Combo
+          </Button>
+        </div>
       </div>
     </Card>
   {:else}

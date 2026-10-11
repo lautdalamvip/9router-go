@@ -1086,6 +1086,20 @@ export const api = {
     request<{ status: string; created: string[]; count: number }>('/api/combos/auto-family', {
       method: 'POST',
     }),
+  /**
+   * One-click optimal set: an "Auto: Optimal" master fallback chain of every
+   * usable chat model (free first, then strongest, then the user's preferred
+   * provider) plus one optimally ordered combo per model family.
+   */
+  buildAutoOptimalCombos: () =>
+    request<{
+      status: string
+      id: string
+      models: string[]
+      count: number
+      truncated: boolean
+      families: string[]
+    }>('/api/combos/auto-optimal', { method: 'POST' }),
 
   // API Keys
   getApiKeys: () => request<APIKey[]>('/api/keys'),

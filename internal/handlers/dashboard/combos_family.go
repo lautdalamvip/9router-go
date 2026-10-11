@@ -34,42 +34,46 @@ func (h *DashboardHandler) HandleAutoFamilyCombos(w http.ResponseWriter, r *http
 		handlerutil.WriteJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-
-	created := make([]string, 0, len(groups))
-	for family, members := range groups {
-		if len(members) < minFamilyMembers {
-			continue
-		}
-		modelsJSON, err := json.Marshal(members)
-		if err != nil {
-			handlerutil.WriteJSONError(w, http.StatusInternalServerError, "failed to encode models")
-			return
-		}
-		id := autoFamilyComboID(family)
-		name := "Auto: " + family
-		existing, err := h.Repo.GetComboById(id)
-		if err != nil {
-			handlerutil.WriteJSONError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		if existing == nil {
-			if err := h.Repo.CreateCombo(id, name, autoFamilyComboKind, string(modelsJSON), "fallback"); err != nil {
-				handlerutil.WriteJSONError(w, http.StatusInternalServerError, err.Error())
-				return
-			}
-		} else if err := h.Repo.UpdateCombo(id, name, autoFamilyComboKind, string(modelsJSON), "fallback"); err != nil {
-			handlerutil.WriteJSONError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		created = append(created, family)
+	priorities, err := h.connectionPriorities()
+	if err != nil {
+		handlerutil.WriteJSONError(w, http.StatusInternalServerError, err.Error())
+		return
 	}
-	sort.Strings(created)
+
+	created, err := h.upsertFamilyCombos(groups, priorities)
+	if err != nil {
+		handlerutil.WriteJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 
 	handlerutil.WriteJSON(w, http.StatusOK, map[string]any{
 		"status":  "ok",
 		"created": created,
 		"count":   len(created),
 	})
+}
+
+// upsertFamilyCombos writes one combo per family with at least minFamilyMembers
+// usable models, ordered optimally, and returns the family names sorted. Shared
+// by the auto-family endpoint and the optimal builder so both write identical
+// rows — whichever button runs last only changes the ordering, never the set.
+func (h *DashboardHandler) upsertFamilyCombos(groups map[string][]string, priorities map[string]int) ([]string, error) {
+	created := make([]string, 0, len(groups))
+	for family, members := range groups {
+		if len(members) < minFamilyMembers {
+			continue
+		}
+		modelsJSON, err := json.Marshal(orderModels(members, priorities))
+		if err != nil {
+			return nil, fmt.Errorf("upsertFamilyCombos: encode %s: %w", family, err)
+		}
+		if err := h.upsertCombo(autoFamilyComboID(family), "Auto: "+family, autoFamilyComboKind, string(modelsJSON)); err != nil {
+			return nil, err
+		}
+		created = append(created, family)
+	}
+	sort.Strings(created)
+	return created, nil
 }
 
 // usableModelFamilies maps a normalized family to every usable "alias/model"

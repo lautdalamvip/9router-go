@@ -5,8 +5,8 @@
     onCreateClick: () => void
     onAutoFreeClick?: () => void
     isBuildingAutoFree?: boolean
-    onAutoFamilyClick?: () => void
-    isBuildingAutoFamily?: boolean
+    onAutoOptimalClick?: () => void
+    isBuildingAutoOptimal?: boolean
     selectedCount?: number
     deletableCount?: number
     onDeleteSelected?: () => void
@@ -17,8 +17,8 @@
     onCreateClick,
     onAutoFreeClick,
     isBuildingAutoFree = false,
-    onAutoFamilyClick,
-    isBuildingAutoFamily = false,
+    onAutoOptimalClick,
+    isBuildingAutoOptimal = false,
     selectedCount = 0,
     deletableCount = 0,
     onDeleteSelected,
@@ -58,15 +58,16 @@
       Create Combo
     </Button>
     <div class="flex gap-2">
-      {#if onAutoFamilyClick}
+      {#if onAutoOptimalClick}
         <Button
-          icon="hub"
-          onclick={onAutoFamilyClick}
-          disabled={isBuildingAutoFamily}
+          icon="auto_awesome"
+          onclick={onAutoOptimalClick}
+          disabled={isBuildingAutoOptimal}
           variant="outline"
           class="flex-1 whitespace-nowrap"
+          title="Build one optimal combo per model family plus an 'Auto: Optimal' master fallback chain"
         >
-          {isBuildingAutoFamily ? 'Grouping...' : 'Auto Group by Model'}
+          {isBuildingAutoOptimal ? 'Building…' : 'Auto Optimal'}
         </Button>
       {/if}
       {#if onAutoFreeClick}
