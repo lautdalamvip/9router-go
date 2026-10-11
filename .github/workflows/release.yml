@@ -11,7 +11,7 @@ permissions:
   packages: write
 
 env:
-  REGISTRY_IMAGE: luqmenul/9router-go
+  REGISTRY_IMAGE: lautdalam/9router-go
 
 jobs:
   # The release channel is derived from the tag and nothing else — not the
@@ -334,3 +334,8 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_TOPIC_ID: ${{ secrets.TELEGRAM_TOPIC_ID }}
+          # The message tells readers which image to pull, so it has to be derived
+          # from the registry this workflow actually pushed to. Left to the
+          # script default it drifted to whatever that default said, and the
+          # announcement pointed at an image this release did not write.
+          DOCKER_IMAGE: ${{ env.REGISTRY_IMAGE }}

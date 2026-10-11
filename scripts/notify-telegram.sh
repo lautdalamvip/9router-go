@@ -94,8 +94,12 @@ if [ -z "$entries" ]; then
   entries="$(grep -E '^[-*] ' "$NOTES_FILE" | head -"$ENTRIES" || true)"
 fi
 
-release_url="https://github.com/luqman-v1/9router-go/releases/tag/${TAG}"
-docker_image="${DOCKER_IMAGE:-luqmenul/9router-go}"
+# The release page lives in whichever repository ran the workflow. Hardcoding the
+# upstream path meant a release published from a fork announced a link to a
+# release page that does not exist there.
+release_repo="${GITHUB_REPOSITORY:-lautdalamvip/9router-go}"
+release_url="https://github.com/${release_repo}/releases/tag/${TAG}"
+docker_image="${DOCKER_IMAGE:-lautdalam/9router-go}"
 
 # A prerelease must not read like a stable install: it is absent from `latest`,
 # so anyone pulling `latest` still gets the previous version.
