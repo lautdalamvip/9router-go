@@ -228,3 +228,70 @@ func TestIsFreeTierModel(t *testing.T) {
 		})
 	}
 }
+
+// TestDeleteComboPathEscaping pins the round trip for an id that has to be
+// percent-encoded on the wire.
+//
+// The dashboard client builds the URL with encodeURIComponent, and chi captures
+// the route parameter off the matched path without decoding it (it matches
+// r.URL.RawPath once that differs from r.URL.Path). The handler therefore saw
+// the literal `auto-family-%40cf/moonshotai-kimi`, ran DELETE against an id
+// that does not exist, and answered 200 — so the combo stayed in the list and
+// re-appeared on every refresh, with no error anywhere to explain it.
+//
+// Only the Cloudflare "@cf/..." families were affected, because they are the
+// only generated ids whose characters the browser escapes; every other id is
+// already URL-safe, which is why exactly two combos looked undeletable.
+func TestDeleteComboPathEscaping(t *testing.T) {
+	const escapedID = "auto-family-@cf-moonshotai-kimi"
+
+	tests := []struct {
+		name   string
+		id     string
+		pathID string
+	}{
+		{
+			name:   "id needing percent-encoding",
+			id:     escapedID,
+			pathID: "auto-family-%40cf-moonshotai-kimi",
+		},
+		{
+			name:   "already url-safe id",
+			id:     "auto-family-gpt",
+			pathID: "auto-family-gpt",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo, cleanup := setupTestDB(t)
+			defer cleanup()
+			router := setupTestRouter(repo)
+
+			if err := repo.CreateCombo(tt.id, "Auto: "+tt.id, "auto-family",
+				`["bzl/auto:free"]`, "fallback"); err != nil {
+				t.Fatalf("seed combo: %v", err)
+			}
+
+			req := httptest.NewRequest(http.MethodDelete, "/api/combos/"+tt.pathID, nil)
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("DELETE %s status = %d, want 200; body = %s",
+					tt.pathID, rec.Code, rec.Body.String())
+			}
+
+			// The status alone proves nothing here: the bug returned 200 while
+			// deleting nothing, which is the whole failure mode.
+			left, err := repo.GetComboById(tt.id)
+			if err != nil {
+				t.Fatalf("GetComboById(%q): %v", tt.id, err)
+			}
+			if left != nil {
+				t.Errorf("combo %q survived DELETE: the handler matched a "+
+					"differently-encoded id", tt.id)
+			}
+		})
+	}
+}

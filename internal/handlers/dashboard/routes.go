@@ -2,6 +2,7 @@ package dashboard
 
 import (
 	"net/http"
+	"net/url"
 
 	"9router/proxy/internal/db"
 	"9router/proxy/internal/handlers/shared"
@@ -38,12 +39,29 @@ func NewDashboardHandler(repo *db.Repo, ts ...*shared.TokenSaverConfig) *Dashboa
 	return h
 }
 
-// getURLParam retrieves a route parameter from Chi URLParam or standard PathValue.
+// getURLParam retrieves a route parameter from Chi URLParam or standard
+// PathValue, decoding percent-escapes first.
+//
+// The decode is load-bearing. chi matches against r.URL.RawPath as soon as it
+// differs from r.URL.Path, and a route parameter is captured off the matched
+// path verbatim, so an id whose value needed escaping arrives escaped and
+// chi.URLParam does not undo it. The dashboard client sends
+// encodeURIComponent(id), so the combo `auto-family-@cf/moonshotai-kimi` is
+// requested as `...-@cf...` with `@` written `%40`; the handler then looked up
+// the literal `auto-family-%40cf/moonshotai-kimi`, deleted no row, and still
+// answered 200 — a delete that reports success and changes nothing.
 func getURLParam(r *http.Request, key string) string {
-	if v := chi.URLParam(r, key); v != "" {
-		return v
+	v := chi.URLParam(r, key)
+	if v == "" {
+		v = r.PathValue(key)
 	}
-	return r.PathValue(key)
+	if v == "" {
+		return ""
+	}
+	if unescaped, err := url.PathUnescape(v); err == nil {
+		return unescaped
+	}
+	return v
 }
 
 // RegisterRoutes registers all dashboard REST endpoints under /api on the router.
