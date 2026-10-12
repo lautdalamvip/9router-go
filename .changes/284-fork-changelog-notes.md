@@ -1,8 +1,8 @@
-### ✨ Auto Group combos by model family — catatan implementasi fork
+### 📝 Catatan implementasi fork — Auto Group combos by model family
 
 - Fixed a latent bug the new feature exposed: `isLlmCombo` rejected any `kind !== 'llm'`, so the auto free-tier combo was invisible on the combos page. It now accepts the `auto-*` kinds while still excluding the upstream `search-combo` media combos.
 
-### 🐛 Dashboard backup import always failed with `Invalid database payload` — catatan implementasi fork
+### 📝 Catatan implementasi fork — dashboard backup import
 
 - `ProfileSettingsView.svelte` posted the chosen file as **`multipart/form-data`**, but `HandleImportDatabase` (like upstream `src/app/api/settings/database/route.js`) does `request.json()` on the body, so every import died at the decode with HTTP 400 and the user saw "Failed to import database: Import failed with status 400". The client now reads `file.text()`, `JSON.parse`s it, and PUTs the raw JSON body — verified against `E:\9router-backup-2026-09-25T15-07-00-715Z.json`.
 - The destructive op also re-authenticates against the stored bcrypt hash, and the client never sent a password at all: once a dashboard password was set, import (and the plain anchor-click export, which is likewise an `x-9r-password`-gated route) returned 401. Upstream prompts in a modal first; the port now does the same — both buttons open a password modal, and the password travels in the `x-9r-password` header, matching upstream exactly.

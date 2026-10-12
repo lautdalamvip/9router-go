@@ -178,6 +178,30 @@ func isDigit(c byte) bool { return c >= '0' && c <= '9' }
 // release — gets the fragments prepended instead. Dropping them would silently
 // hide shipped work, which is the one failure mode this split was meant to
 // avoid.
+
+// findUnreleasedHeading returns the offset of the `## [Unreleased]` section
+// heading, or -1 when the changelog has none.
+//
+// The heading has to be the whole line. Searching for the text anywhere finds it
+// inside prose: CHANGELOG.md's v1.9.11 notes explain this fragment mechanism and
+// quote `## [Unreleased]` mid-sentence, so a substring search splices every
+// pending entry into the middle of a release-notes bullet — splitting a sentence,
+// burying the new entries under released ones, and leaving the dashboard showing a
+// changelog that is wrong in a way nobody would look for. Trailing CR is tolerated
+// because the working tree is checked out with CRLF.
+func findUnreleasedHeading(changelog string) int {
+	for offset := 0; offset < len(changelog); {
+		lineEnd := strings.IndexByte(changelog[offset:], '\n')
+		if lineEnd < 0 {
+			lineEnd = len(changelog) - offset
+		}
+		if strings.TrimRight(changelog[offset:offset+lineEnd], "\r \t") == unreleasedHeading {
+			return offset
+		}
+		offset += lineEnd + 1
+	}
+	return -1
+}
 func splice(changelog string, frags []string) string {
 	if len(frags) == 0 {
 		return changelog
@@ -189,7 +213,7 @@ func splice(changelog string, frags []string) string {
 	// body text of the previous bullet instead of as its own heading.
 	block := unreleasedHeading + "\n\n" + strings.Join(frags, "\n\n") + "\n"
 
-	at := strings.Index(changelog, unreleasedHeading)
+	at := findUnreleasedHeading(changelog)
 	if at < 0 {
 		return block + "\n" + strings.TrimLeft(changelog, "\n")
 	}

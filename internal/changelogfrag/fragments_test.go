@@ -219,3 +219,69 @@ func TestAssembleSeparatesFragmentsWithBlankLine(t *testing.T) {
 		}
 	}
 }
+
+// `## [Unreleased]` is not only a section heading; it is also *quoted in prose*.
+// The v1.9.11 release notes explain this fragment mechanism and write it out
+// mid-sentence ("baris 5-6 (`## [Unreleased]` + entry pertama)"). A substring
+// search mistook that quote for the section and spliced every pending entry into
+// the middle of a bullet, cutting the sentence in half and burying the new
+// entries under released ones.
+//
+// This is not hypothetical: after a release, upstream's own CHANGELOG.md has no
+// `[Unreleased]` section at all, only the quote — and the fragments to splice.
+// The heading therefore has to match as a whole line.
+func TestSpliceAnchorsUnreleasedHeadingToLine(t *testing.T) {
+	const prose = "- Setiap PR menulis entry di baris 5-6 (`## [Unreleased]` + entry pertama).\n"
+	const releasedOnly = "# Changelog\n\n## [v1.9.11] - 2026-10-12\n\n" + prose +
+		"\n## [v1.9.9] - 2026-10-01\n\n- initial\n"
+
+	tests := []struct {
+		name          string
+		changelog     string
+		wantPrepended bool
+	}{
+		{
+			name:          "heading appears only inside prose",
+			changelog:     releasedOnly,
+			wantPrepended: true,
+		},
+		{
+			name:          "real heading wins over a later prose mention",
+			changelog:     "# Changelog\n\n" + unreleasedHeading + "\n\n## [v1.9.11] - 2026-10-12\n\n" + prose,
+			wantPrepended: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := newRepo(t, map[string]string{
+				"CHANGELOG.md":         tt.changelog,
+				".changes/219-chat.md": "### chat fix",
+			})
+
+			got := Assemble(root)
+
+			if !strings.Contains(got.Markdown, prose) {
+				t.Errorf("the prose quoting the heading was split:\n%s", got.Markdown)
+			}
+			frag := strings.Index(got.Markdown, "### chat fix")
+			rel := strings.Index(got.Markdown, "## [v1.9.11]")
+			if frag < 0 {
+				t.Fatalf("fragment missing from:\n%s", got.Markdown)
+			}
+
+			if !tt.wantPrepended {
+				if frag > rel {
+					t.Errorf("fragment was not spliced under the real heading:\n%s", got.Markdown)
+				}
+				return
+			}
+			if !strings.HasPrefix(got.Markdown, unreleasedHeading+"\n") {
+				t.Errorf("fragments were not prepended to a changelog with no heading:\n%s", got.Markdown)
+			}
+			if frag > rel {
+				t.Errorf("fragment landed below the released section:\n%s", got.Markdown)
+			}
+		})
+	}
+}
