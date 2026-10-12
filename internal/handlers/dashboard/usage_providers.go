@@ -90,6 +90,8 @@ func fetchProviderUsage(ctx context.Context, provider string, data map[string]an
 		return fetchGrokCliUsage(ctx, accessToken, psd), true
 	case "codex":
 		return fetchCodexUsage(ctx, firstNonEmptyStr(accessToken, apiKey)), true
+	case "claude":
+		return fetchClaudeUsage(ctx, firstNonEmptyStr(accessToken, apiKey)), true
 	case "opencode-zen":
 		return fetchOpenCodeZenUsage(ctx, apiKey, connectionBaseURL(data)), true
 	case "minimax-code", "minimax-code-global":
