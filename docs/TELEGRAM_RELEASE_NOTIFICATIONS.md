@@ -85,7 +85,7 @@ What's new:
 … up to 10 entries
 
 Release notes: https://github.com/luqman-v1/9router-go/releases/tag/v1.9.11
-    docker pull luqmenul/9router-go:1.9.11
+    docker pull lautdalam/9router-go:1.9.11
 ```
 
 Only headings are listed, not their bullets: the full notes live on the

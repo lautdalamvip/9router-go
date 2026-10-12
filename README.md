@@ -136,7 +136,7 @@ docker run -d --name 9router-go --restart unless-stopped \
   -p 20130:20130 -v "$HOME/.9router:/data" \
   -e PORT=20130 -e DATA_DIR=/data \
   -e INITIAL_PASSWORD=your-secure-password \
-  luqmenul/9router-go:latest
+  lautdalam/9router-go:latest
 
 # Manual download — pick your file, no command line guesswork:
 # Windows → .exe | Mac M1+ → darwin-arm64 | Mac Intel → darwin-amd64
@@ -220,10 +220,10 @@ separately and are never offered to a normal install:
 
 - GitHub Releases marks them **Pre-release**, so `releases/latest` — the URL
   `9router-go update` falls back to — keeps pointing at the stable version.
-- Docker Hub tags them `exp` (`luqmenul/9router-go:exp`), never `latest`.
+- Docker Hub tags them `exp` (`lautdalam/9router-go:exp`), never `latest`.
 
 ```bash
-docker pull luqmenul/9router-go:exp
+docker pull lautdalam/9router-go:exp
 ```
 
 Opt in only if you want to help shake out bugs. `9router-go update` will not
