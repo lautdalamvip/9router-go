@@ -172,6 +172,7 @@ var oauthProbeConfigs = map[string]oauthProbeConfig{
 		url:            codexProbeURL,
 		method:         http.MethodPost,
 		authHeader:     "Authorization",
+		authPrefix:     "Bearer ",
 		extraHeaders:   map[string]string{"Content-Type": "application/json", "originator": "codex_cli_rs", "User-Agent": providers.CodexCLIUserAgent, "version": providers.CodexCLIVersionHeader},
 		body:           `{"model":"gpt-5.3-codex","input":[],"stream":false,"store":false}`,
 		acceptStatuses: []int{http.StatusBadRequest},
@@ -643,14 +644,14 @@ func (h *DashboardHandler) probeOAuthConnection(ctx context.Context, conn *model
 
 // probeOAuthEndpoint runs the generic configured probe plus the 401 retry path.
 func (h *DashboardHandler) probeOAuthEndpoint(ctx context.Context, provider string, cfg oauthProbeConfig, client *http.Client, accessToken string, refreshed bool, tokens *oauth.TokenResult, data connectionProbeData) probeOutcome {
-	attempt := runOAuthProbe(ctx, cfg, client, accessToken)
+	attempt := runOAuthProbe(ctx, cfg, client, accessToken, data)
 	if attempt.valid {
 		return probeOutcome{valid: true, message: attempt.message, refreshed: refreshed, tokens: tokens}
 	}
 	if attempt.status == http.StatusUnauthorized && cfg.refreshable && !refreshed && data.RefreshToken != "" {
 		retryTokens := h.refreshConnectionToken(ctx, provider, data, client)
 		if retryTokens != nil {
-			retry := runOAuthProbe(ctx, cfg, client, retryTokens.AccessToken)
+			retry := runOAuthProbe(ctx, cfg, client, retryTokens.AccessToken, data)
 			if retry.valid {
 				return probeOutcome{valid: true, message: retry.message, refreshed: true, tokens: retryTokens}
 			}
@@ -777,8 +778,11 @@ type oauthProbeAttempt struct {
 }
 
 // runOAuthProbe performs the configured request and classifies the answer the
-// way upstream's classifyOAuthProbeResult does.
-func runOAuthProbe(ctx context.Context, cfg oauthProbeConfig, client *http.Client, accessToken string) oauthProbeAttempt {
+// way upstream's classifyOAuthProbeResult does. data carries the connection's
+// stored fields; the codex backend rejects requests without the account
+// header, so the probe must send it exactly like the request path does
+// (ForwardCodex) — otherwise a healthy connection always probes "invalid".
+func runOAuthProbe(ctx context.Context, cfg oauthProbeConfig, client *http.Client, accessToken string, data connectionProbeData) oauthProbeAttempt {
 	target := cfg.url
 	if cfg.buildURL != nil {
 		target = cfg.buildURL(accessToken)
@@ -793,6 +797,9 @@ func runOAuthProbe(ctx context.Context, cfg oauthProbeConfig, client *http.Clien
 	headers := map[string]string{}
 	for k, v := range cfg.extraHeaders {
 		headers[k] = v
+	}
+	if accountID, _ := data.ProviderSpecificData["chatgptAccountId"].(string); accountID != "" {
+		headers["chatgpt-account-id"] = accountID
 	}
 	if !cfg.noAuth {
 		header := cfg.authHeader

@@ -155,6 +155,7 @@ func strictOnly(ctx context.Context) bool {
 // http.NewRequestWithContext installs a GetBody and no replay has to buffer a
 // body the first attempt already consumed.
 func newJSONRequest(ctx context.Context, method, url string, headers map[string]string, body []byte) (*http.Request, error) {
+	body = canonicalChatBody(body)
 	req, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(body))
 	if err != nil {
 		return nil, err

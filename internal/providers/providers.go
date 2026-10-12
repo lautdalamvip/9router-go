@@ -140,6 +140,9 @@ var modelsListURL = map[string]string{
 	// so the live-catalog fetch carries it on top of the bearer token
 	// (upstream PROVIDER_MODELS_CONFIG.muse).
 	"muse": "https://api.meta.ai/v1/models",
+	// SumoPod exposes the standard OpenAI /v1/models catalogue (auth required,
+	// same contract as tokenharbor/dahl).
+	"sumopod": "https://ai.sumopod.com/v1/models",
 }
 
 // modelsListHeaders carries the extra headers one live-catalogue endpoint
@@ -308,6 +311,14 @@ var KnownProviders = map[string]ProviderConfig{
 	},
 	"deepseek": {
 		BaseURL:    "https://api.deepseek.com/chat/completions",
+		AuthHeader: "Authorization",
+		AuthScheme: "bearer",
+	},
+	// SumoPod — Indonesian AI gateway (ai.sumopod.com), OpenAI-compatible
+	// chat completions with 60+ models across Claude, Gemini, GPT, DeepSeek,
+	// Qwen, GLM, Kimi, MiniMax, Seed, Grok, Hy and Mimo.
+	"sumopod": {
+		BaseURL:    "https://ai.sumopod.com/v1/chat/completions",
 		AuthHeader: "Authorization",
 		AuthScheme: "bearer",
 	},
