@@ -98,8 +98,29 @@ want() {
   fi
 }
 
-want .github/workflows/ci.yml             'REGISTRY_IMAGE: lautdalam/9router-go'
-want .github/workflows/ci.yml             'docker-publish'
+# ci.yml is upstream-owned: this fork keeps no edits in it, so every upstream
+# change to the CI workflow merges in instead of colliding. The fork's own
+# Docker job lives in docker-publish.yml, a file upstream does not have, which
+# is why it can never be dropped by a merge.
+same_as_upstream() {
+  local ours theirs
+  ours=$(git ls-files -s -- "$1" | awk '{print $2}')
+  theirs=$(git ls-tree "$UP" -- "$1" | awk '{print $3}')
+  if [ "$ours" != "$theirs" ]; then
+    printf '  DRIFTED FROM UPSTREAM: %s\n' "$1" >&2
+    printf '    this file is supposed to stay upstream-owned so upstream edits merge in;\n' >&2
+    printf '    put the fork edit in a fork-owned workflow file instead\n' >&2
+    MISSING=1
+  fi
+}
+same_as_upstream .github/workflows/ci.yml
+
+want .github/workflows/docker-publish.yml 'REGISTRY_IMAGE: lautdalam/9router-go'
+want .github/workflows/docker-publish.yml 'docker-publish'
+# Without this the multi-arch build fails: BuildKit has no binfmt handler for
+# the foreign architecture. Caught once already, after the job was written
+# without it.
+want .github/workflows/docker-publish.yml 'setup-qemu-action'
 want .github/workflows/release.yml        'REGISTRY_IMAGE: lautdalam/9router-go'
 want scripts/notify-telegram.sh           'lautdalam/9router-go'
 want internal/handlers/dashboard/combos_optimal.go 'autoOptimalComboName'
@@ -110,7 +131,7 @@ want web/src/components/combos/CombosView.svelte 'onAutoOptimalClick'
 want web/src/api/client.ts                'buildAutoOptimalCombos'
 
 if [ "$MISSING" -ne 0 ]; then
-  printf '\nsync-upstream: the merge dropped fork customisations that must survive.\n' >&2
+  printf '\nsync-upstream: invariants do not hold after the merge — one of the states above.\n' >&2
   printf 'Nothing is lost — go back with:\n\n    git reset --hard %s\n\n' "$BACKUP" >&2
   exit 1
 fi

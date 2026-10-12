@@ -1,0 +1,90 @@
+# Fork-only workflow. Upstream owns ci.yml and release.yml; keeping this fork's
+# Docker publishing in a file upstream does not have means a sync can never drop
+# it, and every upstream edit to those two files merges in cleanly instead of
+# colliding with an appended job. See docs/FORK_SYNC.md.
+name: Publish Docker image
+
+on:
+  # Not a plain `push`, because the test suite has to pass first. When this job
+  # lived in ci.yml that guarantee came from `needs: [test, race, integration,
+  # docker]`; a job cannot gate a workflow it is not part of, and publishing a
+  # red commit is how a broken gateway reaches whoever just pulled it.
+  # `workflow_run` restores the guarantee without editing upstream's file: this
+  # fires when the CI workflow on main has completed.
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+
+# The run itself needs nothing from the repository beyond reading it. Docker Hub
+# credentials are secrets, not GITHUB_TOKEN.
+permissions:
+  contents: read
+
+env:
+  # A push to a repository that does not exist yet creates it, so the only setup
+  # this needs is a DOCKERHUB_USERNAME and a DOCKERHUB_TOKEN that may write here.
+  REGISTRY_IMAGE: lautdalam/9router-go
+
+jobs:
+  docker-publish:
+    name: Publish Docker image
+    # `completed` also fires for a failed, cancelled or skipped CI run.
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      # The commit CI actually verified. `github.sha` is deliberately not used:
+      # on a workflow_run event it is the default branch as of delivery time,
+      # which can already be one push ahead of the run that succeeded.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      # Required for the arm64 half of the build below. Without it BuildKit has
+      # no binfmt handler for the foreign architecture and the multi-platform
+      # build fails; release.yml's multi-arch job sets it up for the same reason.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Three tags, three jobs. `latest` is what a bare `docker pull` resolves,
+      # so it has to move with main. The branch tag names the line the image came
+      # from. `sha-<short>` is the only tag never rewritten, which is what makes
+      # a running container traceable back to a commit.
+      #
+      # Written out rather than delegated to docker/metadata-action: its `{{sha}}`
+      # is the commit that triggered the workflow run, and on a workflow_run
+      # event that is main's tip rather than the commit being built — so the one
+      # tag whose entire purpose is traceability would point at the wrong commit.
+      # The event payload carries the right SHA, so it is used directly.
+      - name: Compute image tags
+        id: tags
+        env:
+          SHA: ${{ github.event.workflow_run.head_sha }}
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          echo "tags=${REGISTRY_IMAGE}:latest,${REGISTRY_IMAGE}:${BRANCH},${REGISTRY_IMAGE}:sha-${SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          # The same pair release.yml publishes, so `latest` and a version tag
+          # are the same image shape: an arm64 host pulling `latest` is not
+          # quietly handed an amd64-only image it would have to emulate.
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.event.workflow_run.head_sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

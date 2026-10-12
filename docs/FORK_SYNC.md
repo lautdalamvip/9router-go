@@ -74,9 +74,10 @@ Set `SKIP_BUILD=1` to skip step 7. `UPSTREAM_REMOTE`, `UPSTREAM_BRANCH` and
 
 If a sync removes any of these, the script fails:
 
-| File | Must contain |
+| File | Must contain / hold |
 | :--- | :--- |
-| `.github/workflows/ci.yml` | `REGISTRY_IMAGE: lautdalam/9router-go`, `docker-publish` |
+| `.github/workflows/ci.yml` | **byte-identical to upstream** — this fork keeps no edits in it |
+| `.github/workflows/docker-publish.yml` | `REGISTRY_IMAGE: lautdalam/9router-go`, `docker-publish`, `setup-qemu-action` |
 | `.github/workflows/release.yml` | `REGISTRY_IMAGE: lautdalam/9router-go` |
 | `scripts/notify-telegram.sh` | `lautdalam/9router-go` |
 | `internal/handlers/dashboard/combos_optimal.go` | `autoOptimalComboName` |
@@ -107,7 +108,17 @@ also edited is dropped. The way to shrink that set is to keep your changes in
 places upstream does not touch:
 
 - New behaviour in **new files** merges cleanly forever (nothing to conflict
-  with) — upstream's edits to the files it owns then arrive untouched.
-- Fork config that must *replace* upstream config (e.g. `REGISTRY_IMAGE`) has to
-  live in upstream's file and will keep conflicting. Keep such edits to as few
-  lines as possible, and read the dropped-file list when it appears.
+  with) — upstream's edits to the files it owns then arrive untouched. This is
+  why the Docker publish job lives in `.github/workflows/docker-publish.yml`
+  (a file upstream does not have) instead of being appended to `ci.yml`: with it
+  in `ci.yml`, an upstream edit to that file cost upstream's edit, and the job
+  itself could be dropped by a careless resolution. The script now asserts
+  `ci.yml` is byte-identical to upstream's, so drift there is reported.
+- The standalone workflow keeps the `needs: [test, race, integration, docker]`
+  guarantee via `on: workflow_run` + `conclusion == 'success'`. A job cannot gate
+  a workflow it is not part of, and publishing a red commit is the failure that
+  gate existed to prevent.
+- Fork config that must *replace* upstream config (e.g. `REGISTRY_IMAGE` in
+  `release.yml`) has to live in upstream's file and will keep conflicting. Keep
+  such edits to as few lines as possible, and read the dropped-file list when it
+  appears.
