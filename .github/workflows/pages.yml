@@ -1,6 +1,6 @@
 name: Deploy site
 
-# The project page (https://luqman-v1.github.io/9router-go) is the README plus
+# The project page (https://lautdalamvip.github.io/9router-go) is the README plus
 # a redirect stub, so it is regenerated on every push that can change either
 # one. Nothing else in this workflow is allowed to fail silently: a broken link
 # rewrite or a missing screenshot has to fail here rather than ship.
