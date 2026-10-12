@@ -171,14 +171,6 @@ func naturalLess(a, b string) bool {
 
 func isDigit(c byte) bool { return c >= '0' && c <= '9' }
 
-// splice inserts the fragments directly beneath the `[Unreleased]` heading so
-// they read as the newest work, leaving every released section untouched.
-//
-// A changelog with no `[Unreleased]` section — everything already folded into a
-// release — gets the fragments prepended instead. Dropping them would silently
-// hide shipped work, which is the one failure mode this split was meant to
-// avoid.
-
 // findUnreleasedHeading returns the offset of the `## [Unreleased]` section
 // heading, or -1 when the changelog has none.
 //
@@ -202,6 +194,34 @@ func findUnreleasedHeading(changelog string) int {
 	}
 	return -1
 }
+
+// prependAfterTitle places the pending block directly below the document's
+// `# Changelog` title, keeping every released section beneath it.
+//
+// Prepending at offset zero instead pushes the title down, so the rendered
+// changelog opens with `## [Unreleased]` and the title reads as though it
+// belonged to the pending entries. A changelog opens with its own title.
+func prependAfterTitle(changelog, block string) string {
+	if !strings.HasPrefix(changelog, "# ") {
+		return block + "\n" + strings.TrimLeft(changelog, "\n")
+	}
+
+	titleEnd := strings.IndexByte(changelog, '\n')
+	if titleEnd < 0 {
+		return changelog + "\n\n" + block
+	}
+
+	rest := strings.TrimLeft(changelog[titleEnd+1:], "\r\n")
+	return changelog[:titleEnd+1] + "\n" + block + "\n" + rest
+}
+
+// splice inserts the fragments directly beneath the `[Unreleased]` heading so
+// they read as the newest work, leaving every released section untouched.
+//
+// A changelog with no `[Unreleased]` section — everything already folded into a
+// release — gets the pending entries placed below its title instead. Dropping
+// them would silently hide shipped work, which is the one failure mode this
+// split was meant to avoid.
 func splice(changelog string, frags []string) string {
 	if len(frags) == 0 {
 		return changelog
@@ -215,7 +235,7 @@ func splice(changelog string, frags []string) string {
 
 	at := findUnreleasedHeading(changelog)
 	if at < 0 {
-		return block + "\n" + strings.TrimLeft(changelog, "\n")
+		return prependAfterTitle(changelog, block)
 	}
 
 	insert := at + len(unreleasedHeading)

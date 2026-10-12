@@ -276,12 +276,40 @@ func TestSpliceAnchorsUnreleasedHeadingToLine(t *testing.T) {
 				}
 				return
 			}
-			if !strings.HasPrefix(got.Markdown, unreleasedHeading+"\n") {
-				t.Errorf("fragments were not prepended to a changelog with no heading:\n%s", got.Markdown)
+			if !strings.HasPrefix(got.Markdown, "# Changelog\n\n"+unreleasedHeading+"\n") {
+				t.Errorf("pending entries did not land under the title when there is no heading:\n%s", got.Markdown)
 			}
 			if frag > rel {
 				t.Errorf("fragment landed below the released section:\n%s", got.Markdown)
 			}
 		})
+	}
+}
+
+// The assembled document is a changelog, so it opens with its own title. When
+// there is no `[Unreleased]` heading the pending entries go below `# Changelog`,
+// not above it: prepending at offset zero pushed the title down so it read as a
+// heading of the pending entries.
+//
+// This is not a corner case. CHANGELOG.md is upstream-owned and upstream has no
+// `[Unreleased]` section after a release, so the fallback runs on every request —
+// the integration suite pins the same contract over HTTP, and it was what caught
+// the title being lost.
+func TestAssembleKeepsTitleAbovePendingEntries(t *testing.T) {
+	root := newRepo(t, map[string]string{
+		"CHANGELOG.md":         "# Changelog\n\n## [v1.9.9] - 2026-10-01\n\n- initial\n",
+		".changes/219-chat.md": "### chat fix",
+	})
+
+	got := Assemble(root)
+
+	if !strings.HasPrefix(got.Markdown, "# Changelog\n\n"+unreleasedHeading+"\n") {
+		t.Errorf("the changelog does not open with its title above the pending entries:\n%s", got.Markdown)
+	}
+	if strings.Index(got.Markdown, "### chat fix") > strings.Index(got.Markdown, "## [v1.9.9]") {
+		t.Errorf("pending entry landed below the released section:\n%s", got.Markdown)
+	}
+	if strings.Count(got.Markdown, "# Changelog") != 1 {
+		t.Errorf("the title is duplicated or missing:\n%s", got.Markdown)
 	}
 }
