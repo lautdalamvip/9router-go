@@ -77,6 +77,7 @@ If a sync removes any of these, the script fails:
 | File | Must contain / hold |
 | :--- | :--- |
 | `.github/workflows/ci.yml` | **byte-identical to upstream** — this fork keeps no edits in it |
+| `CHANGELOG.md` | **byte-identical to upstream** — fork entries live in `.changes/` fragments |
 | `.github/workflows/docker-publish.yml` | `REGISTRY_IMAGE: lautdalam/9router-go`, `docker-publish`, `setup-qemu-action` |
 | `.github/workflows/release.yml` | `REGISTRY_IMAGE: lautdalam/9router-go` |
 | `scripts/notify-telegram.sh` | `lautdalam/9router-go` |
@@ -122,3 +123,24 @@ places upstream does not touch:
   `release.yml`) has to live in upstream's file and will keep conflicting. Keep
   such edits to as few lines as possible, and read the dropped-file list when it
   appears.
+
+### `CHANGELOG.md` is upstream-owned too, and why
+
+Upstream's release tooling rewrites `CHANGELOG.md` wholesale: `make changelog-merge`
+files every `.changes/` fragment under a new `## [TAG]` heading and clears the
+fragments. So a fork edit anywhere in that file makes **every future release
+section conflict**, and `-X ours` then keeps the fork's copy and silently drops
+upstream's release notes — the fork's changelog page would freeze while upstream's
+moved on.
+
+Fork entries therefore belong in `.changes/` fragments (the same rule
+`AGENTS.md` §7.6 sets for pull requests). Fragments are files upstream does not
+have, so they never collide and never get dropped.
+
+This fork had drifted: its `## [Unreleased]` block was an 860-line duplicate of
+content upstream had already released under v1.9.10/v1.9.6/v1.9.5, and it was
+missing upstream's `## [v1.9.11]` entirely. Adopting upstream's file cost exactly
+**5 lines out of 4166** — fork-specific implementation notes on two already
+released entries — which now live in `.changes/284-fork-changelog-notes.md`. If
+you ever run `make changelog-merge` in the fork, the sync script will report
+drift on `CHANGELOG.md`; that is deliberate, not a bug.

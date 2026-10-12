@@ -109,11 +109,21 @@ same_as_upstream() {
   if [ "$ours" != "$theirs" ]; then
     printf '  DRIFTED FROM UPSTREAM: %s\n' "$1" >&2
     printf '    this file is supposed to stay upstream-owned so upstream edits merge in;\n' >&2
-    printf '    put the fork edit in a fork-owned workflow file instead\n' >&2
+    printf '    for workflows: put the fork edit in a fork-owned workflow file instead;\n' >&2
+    printf '    for CHANGELOG.md: put the entry in a .changes/ fragment instead\n' >&2
     MISSING=1
   fi
 }
 same_as_upstream .github/workflows/ci.yml
+# CHANGELOG.md is upstream-owned for a different reason: upstream's release
+# tooling rewrites it wholesale (`make changelog-merge` files every fragment
+# under a new `## [TAG]` heading). A fork edit there makes every future release
+# section conflict, and `-X ours` would then keep the fork's copy and drop
+# upstream's release notes. Fork entries belong in .changes/ fragments, which
+# upstream does not have and which therefore never collide -- this repo's own
+# rule too (AGENTS.md 7.6). Running `make changelog-merge` in the fork will trip
+# this assertion, deliberately: that is a decision, not an accident.
+same_as_upstream CHANGELOG.md
 
 want .github/workflows/docker-publish.yml 'REGISTRY_IMAGE: lautdalam/9router-go'
 want .github/workflows/docker-publish.yml 'docker-publish'
