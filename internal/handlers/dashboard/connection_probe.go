@@ -14,6 +14,7 @@ import (
 	"9router/proxy/internal/handlerutil"
 	"9router/proxy/internal/models"
 	"9router/proxy/internal/providers"
+	"9router/proxy/internal/proxy"
 	"9router/proxy/internal/proxy/executor"
 	"9router/proxy/internal/proxy/oauth"
 )
@@ -328,6 +329,9 @@ func parseConnectionProbeData(raw map[string]any) connectionProbeData {
 // testSingleConnection mirrors testSingleConnection(id): resolve the proxy,
 // pre-check it, then run the api-key or OAuth probe.
 func (h *DashboardHandler) testSingleConnection(ctx context.Context, conn *models.ProviderConnection, data connectionProbeData, raw map[string]any) probeOutcome {
+	if conn != nil && providers.IsLocalByDesign(conn.Provider) {
+		ctx = proxy.WithAllowLoopback(ctx)
+	}
 	client, proxyURL := h.probeHTTPClient(data, raw)
 	if proxyURL != "" {
 		if err := probeProxyURL(ctx, proxyURL); err != nil {
@@ -391,8 +395,10 @@ func (h *DashboardHandler) probeHTTPClient(data connectionProbeData, raw map[str
 	if err != nil {
 		return nil, ""
 	}
+	tr := proxy.NewSafeTransport()
+	tr.Proxy = http.ProxyURL(parsed)
 	return &http.Client{
-		Transport: &http.Transport{Proxy: http.ProxyURL(parsed)},
+		Transport: tr,
 		Timeout:   connectionProbeTimeout,
 	}, proxyURLStr
 }
@@ -425,8 +431,10 @@ func probeProxyURL(ctx context.Context, proxyURLStr string) error {
 	ctx, cancel := context.WithTimeout(ctx, connectionProxyProbeTimeout)
 	defer cancel()
 
+	tr := proxy.NewSafeTransport()
+	tr.Proxy = http.ProxyURL(parsed)
 	client := &http.Client{
-		Transport: &http.Transport{Proxy: http.ProxyURL(parsed)},
+		Transport: tr,
 		Timeout:   connectionProxyProbeTimeout,
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://www.google.com/generate_204", nil)

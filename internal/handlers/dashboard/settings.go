@@ -19,6 +19,7 @@ import (
 	"9router/proxy/internal/auth"
 	"9router/proxy/internal/config"
 	"9router/proxy/internal/handlerutil"
+	"9router/proxy/internal/proxy"
 )
 
 // Dashboard client headers, matching the Next dashboard settings/database route.
@@ -258,8 +259,10 @@ func (h *DashboardHandler) HandleProxyTest(w http.ResponseWriter, r *http.Reques
 		}
 	}
 
+	tr := proxy.NewSafeTransport()
+	tr.Proxy = http.ProxyURL(parsed)
 	client := &http.Client{
-		Transport: &http.Transport{Proxy: http.ProxyURL(parsed)},
+		Transport: tr,
 		Timeout:   timeout,
 	}
 	started := time.Now()

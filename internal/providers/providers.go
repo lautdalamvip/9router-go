@@ -30,6 +30,10 @@ type ProviderConfig struct {
 	// detection keys off that host, so a gateway like Bedrock needs its own flag for the
 	// response to be translated rather than passed through.
 	UpstreamIsAnthropic bool
+
+	// LocalByDesign marks a provider whose upstream endpoint is intended to run on the
+	// local host or loopback network (e.g. ollama-local on localhost:11434).
+	LocalByDesign bool
 }
 
 // Bedrock protocol constants. Region is substituted per request by the executor, so the
@@ -657,9 +661,10 @@ var KnownProviders = map[string]ProviderConfig{
 		},
 	},
 	"ollama-local": {
-		BaseURL:    "http://localhost:11434/v1/chat/completions",
-		AuthHeader: "Authorization",
-		AuthScheme: "bearer",
+		BaseURL:       "http://localhost:11434/v1/chat/completions",
+		AuthHeader:    "Authorization",
+		AuthScheme:    "bearer",
+		LocalByDesign: true,
 	},
 	"minimax-cn": {
 		BaseURL:    "https://api.minimaxi.com/v1/chat/completions",
@@ -1140,4 +1145,13 @@ var RetryableStatusCodes = map[int]bool{
 	http.StatusBadGateway:         true, // 502
 	http.StatusServiceUnavailable: true, // 503
 	http.StatusGatewayTimeout:     true, // 504
+}
+
+// IsLocalByDesign reports whether a provider's official upstream is intended
+// to run locally on loopback (e.g. ollama-local on localhost:11434).
+func IsLocalByDesign(provider string) bool {
+	if cfg, ok := KnownProviders[provider]; ok {
+		return cfg.LocalByDesign
+	}
+	return false
 }

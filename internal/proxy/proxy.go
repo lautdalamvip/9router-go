@@ -14,7 +14,6 @@ import (
 	"strings"
 	"sync"
 
-	"9router/proxy/internal/constants"
 	"9router/proxy/internal/log"
 )
 
@@ -65,7 +64,7 @@ func (e *UpstreamError) Error() string {
 var ErrStrictProxyRequired = errors.New("proxy required but failed (strictProxy=true)")
 
 var directProxyClient = &http.Client{
-	Transport: constants.DefaultHTTPTransportConfig.NewTransport(),
+	Transport: NewSafeTransport(),
 }
 
 // insecureClientCache memoises one InsecureSkipVerify client per proxy URL,
@@ -104,7 +103,7 @@ func InsecureClientFor(proxyURL string) *http.Client {
 	if client, ok = insecureClients[proxyURL]; ok {
 		return client
 	}
-	transport := constants.DefaultHTTPTransportConfig.NewTransport()
+	transport := NewSafeTransport()
 	transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	if proxyURL != "" {
 		if u, err := url.Parse(proxyURL); err == nil {
