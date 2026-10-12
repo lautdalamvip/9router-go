@@ -257,6 +257,8 @@ return oauthTokenResult{token: currentToken, projectID: projectID, passthrough: 
 				log.Error("oauth", "unmarshal connection data failed", "conn", connectionID, "error", err)
 				existing = make(map[string]any)
 			}
+			prevAccess, _ := existing["accessToken"].(string)
+			oauth.SyncMirroredAPIKey(existing, provider, prevAccess, result.AccessToken)
 			for k, v := range update {
 				existing[k] = v
 			}
@@ -298,6 +300,8 @@ return oauthTokenResult{token: currentToken, projectID: projectID, passthrough: 
 			log.Error("oauth", "unmarshal connection data failed", "conn", connectionID, "error", err)
 			existing = make(map[string]any)
 		}
+		prevAccess, _ := existing["accessToken"].(string)
+		oauth.SyncMirroredAPIKey(existing, provider, prevAccess, tokenResp.AccessToken)
 		for k, v := range update {
 			existing[k] = v
 		}
@@ -385,6 +389,8 @@ func (h *ChatHandler) forceRefreshOAuthToken(connectionID string) (string, strin
 					log.Error("oauth", "unmarshal conn data failed", "conn", connectionID, "error", err)
 					existing = make(map[string]any)
 				}
+				prevAccess, _ := existing["accessToken"].(string)
+				oauth.SyncMirroredAPIKey(existing, provider, prevAccess, result.AccessToken)
 				existing["accessToken"] = result.AccessToken
 				if result.RefreshToken != "" {
 					existing["refreshToken"] = result.RefreshToken
@@ -434,6 +440,8 @@ func (h *ChatHandler) forceRefreshOAuthToken(connectionID string) (string, strin
 			log.Error("oauth", "unmarshal conn data failed", "conn", connectionID, "error", err)
 			existing = make(map[string]any)
 		}
+		prevAccess, _ := existing["accessToken"].(string)
+		oauth.SyncMirroredAPIKey(existing, provider, prevAccess, tokenResp.AccessToken)
 		for k, v := range update {
 			existing[k] = v
 		}
