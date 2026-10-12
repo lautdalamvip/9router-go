@@ -64,7 +64,7 @@
           onclick={onAutoOptimalClick}
           disabled={isBuildingAutoOptimal}
           variant="outline"
-          class="flex-1 whitespace-nowrap"
+          class="whitespace-nowrap"
           title="Build one optimal combo per model family plus an 'Auto: Optimal' master fallback chain"
         >
           {isBuildingAutoOptimal ? 'Building…' : 'Auto Optimal'}
@@ -76,7 +76,7 @@
           onclick={onAutoFreeClick}
           disabled={isBuildingAutoFree}
           variant="secondary"
-          class="flex-1 whitespace-nowrap"
+          class="whitespace-nowrap"
         >
           {isBuildingAutoFree ? 'Building...' : 'Auto Free Tier'}
         </Button>
@@ -89,7 +89,7 @@
           onclick={onDeleteSelected}
           disabled={selectedCount === 0}
           variant="danger"
-          class="flex-1 whitespace-nowrap"
+          class="whitespace-nowrap"
         >
           Delete Selected ({selectedCount})
         </Button>
@@ -100,7 +100,7 @@
           onclick={onDeleteAll}
           disabled={deletableCount === 0}
           variant="outline"
-          class="flex-1 whitespace-nowrap"
+          class="whitespace-nowrap"
         >
           Delete All ({deletableCount})
         </Button>
