@@ -45,7 +45,7 @@ func TestRenderSystemdUnit(t *testing.T) {
 			"ExecStart=/usr/local/bin/9router-go --rtk=true",
 			"WantedBy=default.target",
 			"Restart=always",
-			"WorkingDirectory=/usr/local/bin",
+			`WorkingDirectory="/usr/local/bin"`,
 		} {
 			if !strings.Contains(unit, want) {
 				t.Errorf("unit missing %q:\n%s", want, unit)
@@ -69,6 +69,66 @@ func TestRenderSystemdUnit(t *testing.T) {
 		unit := renderSystemdUnit("/opt/my apps/9router-go", nil)
 		if !strings.Contains(unit, `ExecStart="/opt/my apps/9router-go"`) {
 			t.Errorf("ExecStart must quote spaced paths:\n%s", unit)
+		}
+	})
+
+	// ExecStart already went through commandLine, so the same class of path
+	// escaped WorkingDirectory until it was routed through quoteSystemdValue:
+	// systemd unquotes the assignment rather than splitting on whitespace, so
+	// a raw spaced path silently truncated at the space and the unit failed to
+	// parse.
+	t.Run("spaced working directory is quoted", func(t *testing.T) {
+		t.Setenv("DATA_DIR", "")
+		unit := renderSystemdUnit("/opt/my apps/9router-go", nil)
+		if !strings.Contains(unit, `WorkingDirectory="/opt/my apps"`) {
+			t.Errorf("WorkingDirectory must quote spaced paths:\n%s", unit)
+		}
+	})
+
+	// Two escapes systemd applies that a shell does not: `%` is a specifier
+	// prefix, and a quote inside the value would otherwise close the quoted
+	// string early and truncate the directory.
+	t.Run("working directory escapes systemd syntax", func(t *testing.T) {
+		t.Setenv("DATA_DIR", "")
+		unit := renderSystemdUnit(`/opt/100%"win"/9router-go`, nil)
+		if !strings.Contains(unit, `WorkingDirectory="/opt/100%%\"win\""`) {
+			t.Errorf("WorkingDirectory must escape %% and quotes:\n%s", unit)
+		}
+	})
+
+	// A trailing backslash is the case plain escaping gets wrong: inside double
+	// quotes systemd treats a backslash as starting an escape, so an unescaped
+	// one before the closing quote eats it and the line runs on. This pins the
+	// escaper directly — filepath.Dir cannot produce a trailing separator
+	// without also swallowing the file name.
+	t.Run("quoteSystemdValue escapes a trailing backslash", func(t *testing.T) {
+		if got := quoteSystemdValue(`/opt/app\`); got != `"/opt/app\\"` {
+			t.Errorf("quoteSystemdValue() = %s, want a doubled trailing backslash", got)
+		}
+	})
+
+	// A plain path is quoted too: systemd only unquotes the value rather than
+	// splitting it, so quoting unconditionally is safe and keeps the escaping
+	// uniform.
+	t.Run("quoteSystemdValue quotes a plain path", func(t *testing.T) {
+		if got := quoteSystemdValue("/usr/local/bin"); got != `"/usr/local/bin"` {
+			t.Errorf("quoteSystemdValue() = %s, want the quoted path", got)
+		}
+	})
+
+	// The unit is written for systemd, so its directory must be a POSIX path on
+	// every runner. filepath.Dir returns backslashes on Windows, and without
+	// filepath.ToSlash the rendered unit carried `\usr\local\bin` — a path
+	// systemd cannot resolve. Asserting the absence of a backslash states the
+	// contract instead of a literal only one platform can produce, which is how
+	// this subtest passed on Windows and failed on Linux.
+	t.Run("working directory carries no backslash on any runner", func(t *testing.T) {
+		t.Setenv("DATA_DIR", "")
+		unit := renderSystemdUnit("/usr/local/bin/9router-go", nil)
+		for _, line := range strings.Split(unit, "\n") {
+			if strings.HasPrefix(line, "WorkingDirectory=") && strings.Contains(line, `\`) {
+				t.Errorf("WorkingDirectory must be slash-separated on every runner: %s", line)
+			}
 		}
 	})
 }

@@ -28,6 +28,8 @@ func serviceInstall(cCtx *cli.Context) error {
 	fmt.Printf("  Entry:   %s\n", info.Path)
 	fmt.Printf("  Command: %s\n", info.Exec)
 	switch {
+	case info.ActiveUnknown:
+		fmt.Println("  State:   enabled — its current state could not be read on this system.")
 	case info.Active:
 		fmt.Println("  State:   enabled and running — it will start automatically on boot.")
 	case info.Enabled:
@@ -75,7 +77,7 @@ func serviceStart(cCtx *cli.Context) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("9router-go started via %s (active: %v, starts on boot)\n", info.Backend, info.Active)
+	fmt.Printf("9router-go started via %s (%s, starts on boot)\n", info.Backend, activeState(info))
 	return nil
 }
 
@@ -103,7 +105,7 @@ func serviceRestart(cCtx *cli.Context) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("9router-go restarted via %s (active: %v)\n", info.Backend, info.Active)
+	fmt.Printf("9router-go restarted via %s (%s)\n", info.Backend, activeState(info))
 	return nil
 }
 
@@ -131,11 +133,26 @@ func serviceStatus(_ *cli.Context) error {
 		fmt.Printf("  Command: %s\n", info.Exec)
 	}
 	fmt.Printf("  Enabled: %v\n", info.Enabled)
-	fmt.Printf("  Active:  %v\n", info.Active)
+	if info.ActiveUnknown {
+		fmt.Println("  Active:  unknown (this backend could not be interrogated)")
+	} else {
+		fmt.Printf("  Active:  %v\n", info.Active)
+	}
 	if hint := inspectHint(info.Backend); hint != "" {
 		fmt.Printf("  Inspect: %s\n", hint)
 	}
 	return nil
+}
+
+// activeState renders the active flag for one-line output. An unanswered
+// probe is reported as unknown rather than as false: start and restart re-probe
+// through Status, so they inherit the same uncertainty that `service status`
+// states explicitly.
+func activeState(info service.Info) string {
+	if info.ActiveUnknown {
+		return "active: unknown"
+	}
+	return fmt.Sprintf("active: %v", info.Active)
 }
 
 // inspectHint prints the native command that introspects the backend entry.
