@@ -100,7 +100,7 @@ func (h *DashboardHandler) usableModelFamilies(ctx context.Context) (map[string]
 	for providerID := range active {
 		alias := providers.GetProviderAlias(providerID)
 		for _, modelID := range providers.GetProviderModels(providerID) {
-			if !isUsableChatModel(providerID, modelID, disabled[alias]) {
+			if !h.isUsableChatModel(providerID, modelID, disabled[alias]) {
 				continue
 			}
 			key := alias + "/" + modelID
@@ -124,7 +124,7 @@ func (h *DashboardHandler) usableModelFamilies(ctx context.Context) (map[string]
 // isUsableChatModel reports whether alias/provider exposes modelID as a chat
 // model the user has not turned off. Embedding, image and audio models are
 // excluded: they cannot serve a chat fallback chain.
-func isUsableChatModel(providerID, modelID string, disabled map[string]struct{}) bool {
+func (h *DashboardHandler) isUsableChatModel(providerID, modelID string, disabled map[string]struct{}) bool {
 	if providers.GetProviderModelKind(providerID, modelID) != "" {
 		return false
 	}
@@ -132,6 +132,9 @@ func isUsableChatModel(providerID, modelID string, disabled map[string]struct{})
 		return false
 	}
 	if _, off := disabled[modelID]; off {
+		return false
+	}
+	if h.Repo != nil && !h.Repo.IsProviderAvailable(providerID, modelID) {
 		return false
 	}
 	return true
