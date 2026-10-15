@@ -12,6 +12,7 @@
     apiType?: string
     stats: ProviderStats
     noAuth?: boolean
+    hasProxy?: boolean
     onClick: () => void
     onToggleAll?: (active: boolean) => void
   }
@@ -22,6 +23,7 @@
     apiType,
     stats,
     noAuth = false,
+    hasProxy = false,
     onClick,
     onToggleAll,
   }: Props = $props()
@@ -88,6 +90,14 @@
               {/if}
             {:else}
               <span class="text-text-muted">No connections</span>
+            {/if}
+            {#if hasProxy}
+              <Badge variant="info" size="sm">
+                <span class="flex items-center gap-1">
+                  <span class="material-symbols-outlined text-[11px]">vpn_lock</span>
+                  Proxy
+                </span>
+              </Badge>
             {/if}
           </div>
         </div>

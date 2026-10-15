@@ -354,6 +354,7 @@
               <ConnectionsView
                 {connections}
                 {providerNodes}
+                {settings}
                 onRefresh={loadData}
                 bind:selectedProviderId
                 onSelectProvider={(id) => navigate('connections', false, id)}

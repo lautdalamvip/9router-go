@@ -1,14 +1,17 @@
 <script lang="ts">
   import { Play, Plus, Search, Server } from 'lucide-svelte'
-  import type { ProviderConnection, ProviderNode } from '../../api/client'
+  import type { ProviderConnection, ProviderNode, Settings } from '../../api/client'
   import Button from '../../lib/ui/Button.svelte'
   import { PROVIDER_CATALOG, isChatProvider } from '../../lib/providers'
   import ProviderCard from './ProviderCard.svelte'
   import { getProviderStats, matchesFilter, matchesSearch } from './types'
+  import { providerUsesProxy } from './providerProxy'
 
   interface Props {
     connections: ProviderConnection[]
     providerNodes: ProviderNode[]
+    /** App settings; used to detect provider-level proxy strategy bindings. */
+    settings?: Settings | null
     onSelectProvider: (id: string) => void
     onToggleAll: (id: string, active: boolean) => void
     /** Opens the unified add-custom-provider dialog; the modal owns the type. */
@@ -18,6 +21,7 @@
   let {
     connections = [],
     providerNodes = [],
+    settings = null,
     onSelectProvider,
     onToggleAll,
     onAddCustom,
@@ -28,6 +32,10 @@
   let showAllApikey = $state(false)
 
   const APIKEY_INITIAL_VISIBLE = 20
+
+  /** True when the provider routes through a proxy (strategy pool or per-connection). */
+  const usesProxy = (providerId: string) =>
+    providerUsesProxy(providerId, connections, settings)
 
   // 1. Custom Providers
   let customNodes = $derived(
@@ -116,6 +124,7 @@
             name={node.name}
             apiType={node.apiType}
             stats={node.stats}
+            hasProxy={usesProxy(node.id)}
             onClick={() => onSelectProvider(node.id)}
             onToggleAll={(active) => onToggleAll(node.id, active)}
           />
@@ -139,6 +148,7 @@
             id={p.id}
             name={p.name}
             stats={p.stats}
+            hasProxy={usesProxy(p.id)}
             onClick={() => onSelectProvider(p.id)}
             onToggleAll={(active) => onToggleAll(p.id, active)}
           />
@@ -163,6 +173,7 @@
             name={p.name}
             stats={p.stats}
             noAuth={p.noAuth}
+            hasProxy={usesProxy(p.id)}
             onClick={() => onSelectProvider(p.id)}
             onToggleAll={(active) => onToggleAll(p.id, active)}
           />
@@ -186,6 +197,7 @@
             id={p.id}
             name={p.name}
             stats={p.stats}
+            hasProxy={usesProxy(p.id)}
             onClick={() => onSelectProvider(p.id)}
             onToggleAll={(active) => onToggleAll(p.id, active)}
           />
