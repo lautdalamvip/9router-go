@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"9router/proxy/internal/providers"
 )
@@ -177,25 +178,63 @@ func TestRefreshMiniMaxCode_TransientFailureIsNotGrantDead(t *testing.T) {
 // of one token must produce exactly one upstream send.
 func TestRefreshMiniMaxCode_DedupesConcurrentRefreshes(t *testing.T) {
 	var hits atomic.Int64
+	inFlight := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
+
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		hits.Add(1)
+		// The first request is held open so its singleflight stays registered for
+		// as long as the second refresh needs to arrive and join it. A second
+		// request means the dedup is gone, so it is let through — the hit
+		// counter below is what reports it.
+		if hits.Add(1) == 1 {
+			close(inFlight)
+			<-release
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"access_token":"a2","refresh_token":"r2","expires_in":3600}`))
 	}))
 	defer srv.Close()
+	// Declared after srv.Close so it runs first: without it the blocked handler
+	// would keep httptest.Close waiting forever on a failing test.
+	defer releaseAll()
 	pinMCodeSite(t, "minimax-code", srv.URL)
 
 	params := &Params{Client: srv.Client(), Provider: "minimax-code", RefreshToken: "shared-token"}
 	var wg sync.WaitGroup
 	results := make([]*TokenResult, 2)
 	errs := make([]error, 2)
-	for i := range 2 {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			results[i], errs[i] = refreshMiniMaxCode(context.Background(), params)
-		}(i)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		results[0], errs[0] = refreshMiniMaxCode(context.Background(), params)
+	}()
+
+	// Refresh 0 must be inside the token endpoint — and therefore inside its
+	// singleflight — before refresh 1 starts. Otherwise the two never overlap
+	// and singleflight (which collapses concurrent calls but does not cache
+	// them) legitimately calls the endpoint twice.
+	<-inFlight
+
+	second := make(chan struct{})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(second)
+		results[1], errs[1] = refreshMiniMaxCode(context.Background(), params)
+	}()
+
+	// singleflight parks refresh 1 only while refresh 0 is still in flight. If
+	// refresh 1 answers here it reached the endpoint on its own, so the dedup is
+	// gone — report that before refresh 0 is let go.
+	select {
+	case <-second:
+		t.Fatal("second refresh completed while the first was still held at the token endpoint: the singleflight dedup is gone")
+	case <-time.After(100 * time.Millisecond):
 	}
+
+	releaseAll()
 	wg.Wait()
 
 	for i := range 2 {
