@@ -44,8 +44,10 @@ jobs:
         id: resolve
         run: |
           set -euo pipefail
-          # A manual dispatch has no tag, so VERSION is the only version there
-          # is and the tag-vs-file check below is skipped rather than faked.
+          # Only a tag can be released: softprops/action-gh-release derives its
+          # ref from github.ref and rejects refs/heads/... with
+          # "GitHub Releases requires a tag". Fail here instead, before the
+          # binaries job spends minutes building artifacts nothing can publish.
           if [ "${GITHUB_REF_TYPE:-tag}" = "tag" ]; then
             TAG="${GITHUB_REF_NAME}"
             VERSION="${TAG#v}"
@@ -60,7 +62,10 @@ jobs:
               exit 1
             fi
           else
-            VERSION="$(cat VERSION)"
+            echo "::error::Release must run from a tag, but this run used '${GITHUB_REF}'."
+            echo "::error::softprops/action-gh-release cannot create a release from refs/heads/..., so nothing was built or published."
+            echo "::error::Re-run workflow_dispatch with a tag selected, or push one: git tag vX.Y.Z && git push origin vX.Y.Z"
+            exit 1
           fi
 
           MANIFEST_VERSION="$(grep -o '"latestVersion": *"[^"]*"' version.json | cut -d'"' -f4)"
