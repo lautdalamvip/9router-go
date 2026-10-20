@@ -1,5 +1,663 @@
 # Changelog
 
+## [v1.9.14] - 2026-10-20
+
+### Fixes
+
+- **translator**: concatenate every `system` and `developer` message with `\n\n` into Responses `instructions` during Chat Completions to Responses translation, instead of silently dropping all but the first (fixes #332, porting decolua/9router#4813).
+
+### Quoted `WorkingDirectory=` made systemd refuse the autostart unit
+
+`service install` wrote `WorkingDirectory="/usr/local/bin"` into the systemd
+user unit. systemd parses that setting with `config_parse_working_directory`,
+which runs the whole remainder of the line through `path_simplify_and_warn`
+without unquoting (unlike `ExecStart=`), so the quotes were taken as part of
+the value and the unit was rejected as not absolute:
+
+```
+WorkingDirectory= path is not absolute: "/usr/local/bin"
+Unit configuration has fatal error, unit will not be started.
+```
+
+The path is now emitted unquoted, with only a literal `%` doubled for specifier
+expansion; whitespace is not a separator for this setting, so a spaced path
+still survives. Closes #329.
+
+The autostart tests now hand each rendered config to a real parser instead of
+matching substrings: `systemd-analyze verify` for the unit, `plutil`/`xmllint`
+for the launchd plist, `sh -n` for the OpenRC and runit scripts, and
+`desktop-file-validate` for the XDG autostart entry. Each check skips where its
+tool is absent rather than passing silently.
+
+### Fixes
+
+- **providers**: allow models carrying the `-free` suffix in `IsOpencodeFreeTierModel` on OpenCode providers (`opencode`, `opencode-zen`, `opencode-go`), ensuring preview and uncataloged free models route to `/inference/v1` on `opencode-zen` connections without manual catalog additions (fixes #327, PR #328).
+
+### ✨ feat(connections): kartu provider di overview menandai yang routing lewat proxy
+
+Sebelumnya satu-satunya indikasi bahwa sebuah provider memakai proxy ada di baris
+tiap koneksi pada halaman detail (`ProviderDetailView`). Kartu pada grid overview
+tidak menunjukkan apa pun, jadi operator harus masuk ke detail satu per satu untuk
+mengetahui provider mana yang egress-nya lewat proxy.
+
+`ProviderCard` sekarang menerima prop `hasProxy` dan menampilkan badge `info`
+(ikon `vpn_lock`) di luar rantai if/else status, sehingga tanda ikut muncul pada
+provider yang `Disabled`, ber-`Error`, maupun `No connections` — bukan hanya pada
+yang `Connected`.
+
+Sinyalnya dihitung `providerUsesProxy` (`web/src/components/connections/providerProxy.ts`),
+yang menandai provider bila **salah satu** terpenuhi:
+
+- `settings.providerStrategies[id].proxyPoolId` terisi — binding pool level provider,
+  yang dipakai provider free tier tanpa koneksi.
+- salah satu koneksi provider itu membawa `proxyPoolId` atau legacy per-connection
+  proxy (`connectionProxyEnabled` + `connectionProxyUrl`).
+
+Sinyal per-koneksi sengaja dibaca lewat `proxyBadgeInfo` yang sudah dipakai baris
+detail, jadi overview dan detail tidak bisa berbeda pendapat. Helper diekstrak ke
+modul terpisah (bukan inline di grid) agar bisa diuji tanpa merender komponen.
+
+Plumbing: `settings` diteruskan `App.svelte` → `ConnectionsView` →
+`ProvidersOverviewGrid`; semuanya prop opsional, jadi komponen tetap bisa dipakai
+sendirian.
+
+Diverifikasi: `bun test src/components/connections/` 74 pass (11 test baru untuk
+`providerUsesProxy`, termasuk kasus negatif — pool id kosong, proxy disabled, dan
+proxy milik provider lain), `bun run build` hijau, dan
+`bun run ratchet:svelte` hijau (0 unresolved identifier, baseline tetap 83).
+
+### feat(deepseek-web): route chat.deepseek.com with a browser-login userToken
+
+Adds the first provider in this build authenticated by a credential a browser
+session produces rather than an API key or an OAuth grant, ported from OmniRoute
+`open-sse/executors/deepseek-web.ts`. The credential is the `userToken` from
+`chat.deepseek.com` → DevTools → Application → Local Storage.
+
+**Why:** the deepseek account a user already has is a free consumer web account,
+not an API plan, and it has been unusable here. `grok-web` and `perplexity-web`
+were already catalogued but had no executor at all, so a chat request fell
+through to the shared passthrough and sent `Authorization: Bearer <cookie>` to a
+site that answers 401.
+
+**What it does, per turn:**
+
+- `GET /api/v0/users/current` exchanges the `userToken` for a short-lived Bearer
+  access token, memoized an hour and dropped on any auth failure. A pasted
+  `{"value":"…"}` localStorage entry is unwrapped, which is the shape a copy out
+  of DevTools actually has.
+- `POST /api/v0/chat_session/create` opens a session, closed again once the turn
+  is done.
+- `POST /api/v0/chat/create_pow_challenge` → a **DeepSeekHashV1** proof of work
+  is solved and returned in `X-Ds-Pow-Response`. That hash is SHA3-256 with the
+  last 23 KECCAK-p[1600] rounds; Go's `crypto/sha3` only exposes 24, so the
+  sponge is implemented in `deepseek_web_pow.go` with the prefix absorbed once and
+  reused per candidate, bounded by a 30s deadline and cancellable from the
+  request context.
+- The upstream event stream is translated to OpenAI chunks, keeping the
+  reasoning and answer channels separate and folding search citations into the
+  answer.
+
+**Details worth knowing:**
+
+- This API reports auth and rate limiting as **HTTP 200 with a code in the
+  body** (40003 / 40002). Both are mapped to 401 / 429, so the router cools down
+  and rotates the account instead of retrying a dead session.
+- A stream that closes without the upstream's `FINISHED` signal is reported as
+  an error, not as a completed turn. Serving the partial text with
+  `finish_reason: stop` is how a client comes to treat a truncated reply as the
+  model's conclusion.
+- `Origin` and `Referer` follow the connection's configured base URL, so a
+  `baseUrl` override is honoured end to end instead of only for the completion
+  call.
+- `deepseek-web` and `gemini-web` are separate entries from `deepseek` and
+  `gemini`, with their own aliases (`ds-web`, `gweb`) and their own model
+  catalogues — pinned by a test, since a cross-alias would send a browser
+  credential to an API endpoint.
+- `AddConnectionModal` now persists `authType: 'cookie'` for a browser-login
+  provider instead of `'apikey'`. The probe dispatcher already branched on
+  `cookie`, so every cookie provider was taking the wrong probe path.
+
+**gemini-web is catalog-only.** `gemini.google.com` has no API the web client
+calls directly — upstream drives it with an embedded Chromium — and this build
+ships no browser. It is listable and manageable; a chat request is refused with
+501 and the reason, and the probe says it cannot check rather than reporting a
+valid cookie as invalid.
+
+**Verification:** `go build ./...` and `go vet ./...` clean.
+`internal/proxy/executor/deepseek_web_pow_test.go` pins the 23-round permutation
+against OmniRoute's own vectors (`deepseek-pow-js-only.test.ts`) plus the block
+boundary cases those vectors never reach.
+`deepseek_web_test.go` drives a whole turn against one `httptest` upstream and
+verifies the call order, that the proof-of-work nonce really satisfies the
+challenge, the browser fingerprint headers, both response shapes, and that a
+truncated stream is not served as complete.
+`validate_web_providers_test.go` covers the probe's two misleading answers: a
+rejected credential arriving as HTTP 200, and a 200 carrying no token.
+`deepseek_web_catalog_test.go` pins the catalog and the provider isolation.
+Live: the credential exchange, session creation and proof-of-work were confirmed
+against the real endpoint — the nonce for a difficulty-144000 challenge is found
+in ~400ms. The completion itself could not be exercised because DeepSeek's status
+page showed an active outage (incident 7116348214287, "Identified") throughout,
+so the stream translator's handling of a healthy response remains unproven
+against the live site. `bun run build`, 344 web tests and `make vet-svelte`
+(0 unresolved identifiers) pass.
+
+### fix(deepseek-web): read the answer the site actually sends, and recover tool calls
+
+Two defects found by running a real turn against chat.deepseek.com, both of
+which the `httptest` fixtures had been shaped to agree with.
+
+**The answer arrived without a topic.** The stream carries three shapes, and only
+one names one:
+
+```
+{"v":{"response":{...fragments...}}}                          the answer, topicless
+{"p":"response/fragments/-1/content","o":"APPEND","v":"x"}   one character at a time
+{"p":"response/status","o":"SET","v":"FINISHED"}               the sign-off
+```
+
+The decoder dispatched on `p`, so the answer fell through to a default branch
+that handled a bare string and dropped an object — losing the whole reply while
+still finding `FINISHED`. The turn therefore reported success with no text, which
+is why a live run answered `502 upstream answered 200 without a completion`. A
+topicless object carrying `response` is now read before the topic switch, and the
+per-character `APPEND` form is folded into the channel already open. A plain
+question went from 2 chunks to 55 and now returns `{"content":"ok"}` live.
+
+**Tool calling is a convention here, not a protocol.** The endpoint has no
+`tools[]` parameter and the stream has no tool-call topic: a model told a tool
+exists answers by *typing* a JSON object one character at a time, in 47 separate
+`APPEND` operations. A client treating that as a normal streaming answer would
+hold `{"name":"get_weather","arguments":{"` with no way to tell a truncated call
+from prose.
+
+So the two paths are kept apart. A request carrying `tools[]` buffers the turn to
+completion and parses only whole JSON — the same guarantee the native API gives,
+since it does not stream tool arguments either. A request without `tools[]`
+reaches none of that code and streams exactly as before. The declarations are
+folded into the prompt, because there is no field to send them in.
+
+Recovery is deliberately conservative: the answer must be a single JSON object
+naming a tool the client actually declared. An undeclared name, prose around the
+object, or malformed JSON is passed through as ordinary content rather than
+guessed at — a wrong guess becomes an invocation the client acts on.
+
+Verified live: a `deepseek-v4-pro` turn asked about the weather and returned
+
+```json
+"finish_reason":"tool_calls",
+"function":{"name":"get_weather","arguments":"{\"city\": \"Jakarta\"}"}
+```
+
+**Also fixed:** `parameters` is accepted as either a JSON Schema object or a
+string, since the OpenAI shape sends an object while several SDKs stringify it
+first; typing it as a string rejected the common form outright.
+
+### fix(deepseek-web): stop the agent loop repeating a tool call forever
+
+An agent driven through this provider called `get_weather`, received the result,
+and called it again on every subsequent turn until its retry cap — reported as
+`Assistant returned empty stop after retry cap`.
+
+The cause was in the prompt, not the model. A tool-calling turn is replayed to
+the web API as text, because the endpoint accepts a single prompt string. An
+assistant turn that ends in a tool call carries `content: null`, so it was
+dropped from the replay entirely. The transcript reached the model as:
+
+```
+User: What is the weather in Jakarta? Use the tool.
+
+Tool result (get_weather) Sunny, 31C, humidity 70%
+```
+
+A result with no visible cause. The model reads that as "I have not called
+anything yet" and calls again, and the loop cannot terminate because the next
+replay is identical.
+
+The call is now rendered into the transcript as `[called <name> with <args>]`
+ahead of the result it produced, and the tool instructions state that such a line
+means the call already happened. Verified live: the two-turn sequence now ends —
+turn one calls the tool, turn two answers *"The weather in Jakarta is sunny with a
+temperature of 31°C and humidity at 70%"* with `finish_reason: stop`.
+
+**Also fixed: prose around the object.** The extractor required the answer to
+*begin* with `{`, so a model that wrote "Let me check that for you." first had
+its whole reply discarded and the client received `content: null` — an empty
+stop, which is the other half of the same symptom. The object is now located
+inside the answer with brace matching that respects strings and escapes, and the
+text around it is returned as the message content rather than dropped.
+
+An undeclared tool name is still refused: a model inventing `delete_everything`
+must never become a call the client executes.
+
+### Note on what is and is not verified
+
+The turn is verified end to end against the live site: a plain question returns
+`{"content":"ok"}`, a tool question returns a whole `tool_calls` message, and the
+two-turn agent sequence terminates instead of repeating the call. Streaming and
+non-streaming were both driven through a booted gateway, directly and through a
+`combo` — 109 chunks, `finish_reason: stop`, `[DONE]`.
+
+Not verified: behaviour under a client's own retry injection. A client that
+appends "Stopped without actionable output; Attempt #N/3" turns on the gateway's
+answer being absent has, in that observed run, appended the notice while the
+gateway had in fact returned the full reply with `status: success` and the
+content recorded. That is a client-side observation, not a finding against this
+provider, and it is recorded here so the next reader does not re-derive it.
+
+### Scope: this provider only
+
+Earlier drafts of this branch also removed `grok-web`, `perplexity-web` and
+`gemini-web` on the grounds that none of them can route here. That removal is
+reverted and out of scope for this PR: it changes three providers a reader did not
+ask about, and each deserves its own discussion. They remain as they were on
+`main` — `grok-web` and `perplexity-web` catalogued with a probe but no executor,
+and `gemini-web` catalogued only. Whether that is the right end state is an open
+question, not something this PR settles.
+
+`deepseek-web` is displayed as "DeepSeek Web" with no product claim, and its
+icon is the same artwork the `deepseek` provider uses.
+
+### fix(deepseek-web): a cut-off tool turn crashed the server instead of answering
+
+The buffered tool path reported an aborted upstream stream by passing a nil
+writer to `deepSeekReportStreamAbort`, which dereferenced it. Every tool turn the
+upstream cut off therefore panicked, and the process died mid-request — the
+client saw a request that never came back rather than a 502, which reads to an
+agent as a hang.
+
+The streaming path was unaffected: it passes the live writer it had been
+streaming through, and only the buffered path ever passed nil. That is why plain
+chats kept working while any request declaring `tools[]` was fatal, and why the
+failure looked intermittent.
+
+`deepSeekReportStreamAbort` now treats a nil writer as "nothing has been written
+yet" and returns the cause, and both tool-path aborts return an ordinary upstream
+failure — which is correct there, since the path buffers and can still answer
+with a status. The nil guard is kept because the shared helper is the one place
+that can be handed a nil from any caller.
+
+`deepseek_web_loop_test.go` pins all three: a cut-off tool turn returns an error
+and writes no SSE bytes, the shared abort helper survives a nil writer, and a body
+that fails mid-read does not hand back a partial accumulator. Verified against the
+pre-fix code — reintroducing it reproduces the same nil dereference.
+
+### fix(deepseek-web): a streaming client got one JSON document and waited forever
+
+The buffered tool path wrote a single `chat.completion` document whatever the
+client had asked for. A client that sent `stream:true` therefore received a body
+with no `data:` frames and no terminator, and waited for an end that was never
+going to arrive — which is what a request that never returns looks like from the
+other end.
+
+Tool arguments are still buffered, because a truncated JSON object is
+indistinguishable from prose and the native API does not stream them either. What
+was wrong was the framing, not the buffering: the buffered turn is now emitted as
+SSE for a streaming client, as one delta followed by a finish chunk and `[DONE]`.
+A client reassembles deltas in order, so re-fragmenting the text would only cost
+allocations. Non-streaming requests keep the single-document shape.
+
+`deepseek_web_loop_test.go` pins the contract in both directions and fails against
+the pre-fix code: a streaming tool request must produce `chat.completion.chunk`
+frames, a `text/event-stream` content type and a `[DONE]`, and a non-streaming one
+must not.
+
+### fix(deepseek-web): read the DSML tool calls the site models actually emit
+
+Asked for a tool call, the models answer in DSML — the site's own element
+syntax — rather than the JSON object the prompt asks for:
+
+```
+<｜｜DSML｜｜ invoke name="web_search">
+<｜｜DSML｜｜ parameter name="query" string="true">cuaca Jakarta hari ini<｜｜DSML｜｜ parameter>
+<｜｜DSML｜｜ invoke>
+```
+
+The extractor only looked for JSON, so the whole block reached the client as
+literal content. The client had no call to run, saw markup ending in
+`parameter>`, and read the turn as a refusal — which is what produced a tool call
+printed instead of performed.
+
+Both dialects are now read, DSML first because it is unambiguous where a
+JSON-shaped object sitting in prose has to be guessed at. Each invoke becomes an
+ordinary call; parameter bodies become JSON string values, and `string="day"`-style
+attributes stay attributes, so they never land where the tool expects a value. An
+invoke naming a tool the client never declared is still rejected and still
+reaches the client as content — but stripped of the markup, since a wall of
+`parameter>` tags is not something to show a user.
+
+The markers use a fullwidth bar (U+FF5C) and are written with padding, so the
+matchers key on the text between the bars rather than a fixed spelling.
+
+`deepseek_web_dsml_test.go` drives the exact block a live answer produced, and
+pins: verbatim parameter text including quotes, undeclared names rejected, a
+truncated block parsed as nothing, prose left alone, and the JSON path still
+working when no markers are present.
+
+### fix(deepseek-web): read Claude-shaped tool declarations
+
+A tool declaration arrives in one of two spellings. OpenAI wraps it —
+`{"type":"function","function":{...}}`. The Claude/Anthropic form puts `name`,
+`description` and `input_schema` at the top level with no wrapper, and clients
+send it just as readily.
+
+Only the first was parsed. A Claude-shaped declaration produced a spec with an
+empty name, which the prompt builder skips — so the model was told about no tools
+at all, fell back on its native DSML, and the markup reached the client as if it
+were the answer. The client had no call to run and no question answered, which is
+what a printed tool call looks like from its side.
+
+Both spellings are folded into one shape at unmarshal time, so nothing downstream
+has to know which arrived. A declaration carrying both resolves to the nested
+one, and a DSML call now matches against a flat declaration as readily as a
+wrapped one.
+
+`deepseek_web_toolshape_test.go` pins: the Claude shape reaching the rendered
+prompt, a DSML call matching it, the OpenAI shape unaffected, a mixed list, both
+spellings at once preferring the nested one, and a malformed declaration failing
+loudly rather than parsing into something empty.
+
+### fix(deepseek-web): match the closing tags the model actually writes
+
+The first version of the DSML parser matched closing tags against the opener
+spelled without a slash — `<｜｜DSML｜｜ invoke>` — which is how the notation reads
+when it is described in prose. A live answer closes them as XML does:
+
+```
+<｜｜DSML｜｜ calls>
+<｜｜DSML｜｜ invoke name="read">
+<｜｜DSML｜｜ parameter name="path" string="true">https://wttr.in/Jakarta</｜｜DSML｜｜ parameter>
+</｜｜DSML｜｜ invoke>
+</｜｜DSML｜｜ calls>
+```
+
+`strings.Index` therefore returned -1 on every block, nothing was parsed, and each
+DSML call went to the client as literal markup — the failure the DSML support was
+written to prevent. The test fixture had been hand-written from the same wrong
+reading, so it agreed with the parser and passed.
+
+Tags are now matched by pattern: the bar may be full-width or ASCII, the marker
+may be padded, and a closing tag may or may not carry its slash. Opening tags
+cannot match a terminator because theirs is followed by `/`, and the stripper
+searches for the terminator from after the opening element so it cannot truncate a
+block at its own first tag.
+
+`deepseek_web_dsml_test.go` now drives a block copied byte for byte out of a live
+answer rather than reconstructed, and additionally pins both close spellings, the
+ASCII pipe, and that both invokes in the live block are recovered in order. The
+suite fails against the previous parser.
+
+### fix(deepseek-web): stop replaying leaked markup back into the conversation
+
+A leaked DSML block is not only shown to the user, it is fed back to the model.
+The client returns the assistant turn in the next request, and the transcript
+renderer replayed its content verbatim, so the model read its own unparsed
+`<｜｜DSML｜｜ invoke>` block as the way this conversation calls tools and answered
+with another one. Every turn leaked again, and each round described the previous
+one: the calls the user saw executed (`Read Jakarta`, `Read Tokyo`) came a turn
+behind the answer that followed them.
+
+An assistant turn is now repaired before it is replayed. A DSML block is stripped,
+and a JSON object is dropped only when it is shaped like a call — `name` plus
+`arguments` or `parameters` — so prose that merely contains JSON is left alone.
+When nothing but markup remains, the turn is recorded as `[called read]` rather
+than dropped, because an empty assistant turn reads to the model as never having
+called anything, which is the retry loop fixed earlier.
+
+The tool prompt also states that native markup is not transmitted and that a reply
+made of `invoke`/`parameter`/`calls` elements is discarded unread, which is what
+the upstream OmniRoute prompt does.
+
+`deepseek_web_transcript_test.go` drives the transcript with the assistant turn
+copied byte for byte out of the leaking request, and fails against the previous
+renderer.
+
+### fix(deepseek-web): stop leaking the DSML wrapper and run every call in an answer
+
+A model wraps its invokes in a `.calls` element, and the extractor consumed only
+the `invoke`. The wrapper was left over, and the text around a call is returned to
+the client as the assistant's preamble — correct for prose that a model writes
+before its call, wrong for markup that happened to enclose it. So every tool turn
+was answered with `content: "<｜｜DSML｜｜ calls></｜｜DSML｜｜ calls>"` alongside a
+perfectly good `tool_calls` array. The user saw an empty pair of tags under their
+own question on every round.
+
+Two changes:
+
+- `deepSeekStripDSML` removes a whole element, from its opening tag to its
+  terminator, for `calls`, `invoke` and `parameter`. Removing only the tags would
+  leave the parameter bodies behind as prose the model never wrote.
+- `deepSeekSurroundingText` strips markup from what it returns, so a wrapper
+  cannot reach the client however it is spelled. It now takes every raw call at
+  once, since the text between several calls is only correct when they are removed
+  together.
+
+An answer is also no longer assumed to hold one call. A model asked about two
+cities writes two invokes in a single reply; the gateway returned the first and
+the client paid a round trip for each, with the remaining call left in the answer
+as markup. `deepSeekExtractToolCalls` returns all of them, de-duplicated by name
+and arguments so a repeated invoke is not executed twice, and the streaming path
+puts them in one frame so the client runs them together.
+
+`go test ./...` green; 6 live turns through `combo-wombo` returned zero leaked
+markup, and the exact polluted history the user reported now answers in prose.
+
+### fix(deepseek-web): read every call in an answer, in both dialects
+
+The plural rule was applied to DSML only. On the JSON path a model asked about two
+cities writes two call objects, and the gateway returned the first while the second
+stayed in the answer as text — so the assistant's content carried a bare
+`{"name": "shell", "arguments": …}` fragment that the user read as a leak. Both
+paths now return every call they find, de-duplicated by name and arguments.
+
+`deepSeekFindJSONObjects` replaces the single-object finder: it returns each
+balanced top-level object and skips past it, so a nested object inside a call's
+arguments is part of its parent rather than a call of its own.
+
+The tool prompt also states that the declared tools are installed and runnable and
+that a command tool executes on a machine with network access. Without that, a
+model read its own tool list as a description of what it lacked and refused with
+"I cannot check live weather, I have no such capability" — or "I have no internet
+access" — while the `shell` tool it needed sat in the same prompt.
+
+`go test ./...` green. Ten live turns through `combo-wombo` with omp's own tool
+set: 10/10 returned `tool_calls`, 0 leaked markup, 0 refusals.
+
+### fix(deepseek-web): require answers to be grounded in the tool results
+
+A failed command followed by a confident table. In the stored turn
+`1792065306584` the tool result was `ls: cannot access '/tmp/jkt.json': No such
+file or directory` and the model answered with a 959-character comparison of both
+cities — temperatures, humidity, wind, UV, sunrise — presented as though wttr.in
+had returned them. Nothing in the client can separate those numbers from real
+ones.
+
+The tool prompt now states that a `Tool result` line is the only source of fact,
+that no figure may be stated which is not in one of those lines, and that an
+empty, failed or not-found result must be reported as such rather than replaced
+from memory.
+
+Verified against the polluted history itself: five live turns with the failed
+result in context, four now detect the failure and re-fetch instead of inventing
+data. One still answered from memory — a prompt rule is a strong nudge, not a
+guarantee, which is why the transcript repair above matters too.
+
+### fix(deepseek-web): number streamed tool calls so a client can tell them apart
+
+`tool_calls[].index` was missing. The OpenAI streaming protocol numbers every
+parallel call in `tool_calls[].index` and clients key their accumulator by that
+number, so a client receiving two calls with no index had nothing to separate them
+with and concatenated both argument objects:
+
+```
+Validation failed for tool "bash": Tool call arguments are not valid JSON.
+Parse Error: Unexpected trailing characters at position 2
+Raw JSON: {}{}
+```
+
+The two calls were both correct; they were simply indistinguishable. The stream
+now emits one frame per call, each carrying `index` 0..n-1, which is the shape
+every other executor in this repository already uses
+(`internal/proxy/executor/stream.go`, tool-call emission). The model's prose still
+travels with the first frame, and the turn keeps its `finish_reason: tool_calls`
+and `[DONE]` terminator.
+
+`deepseek_web_stream_test.go` parses the emitted frames the way a streaming client
+does and fails against the previous single-frame writer.
+
+### fix(deepseek-web): mint unique tool-call ids
+
+The call ids came from `time.Now().UnixNano() % 1_000_000`. Two calls minted in
+the same turn received the same id **every time**, because the clock does not
+advance between them — on Windows it moves in steps of hundreds of microseconds:
+
+```
+first  = "call_shell_969000"
+second = "call_shell_969000"
+```
+
+A client that groups parallel calls by `id` — the natural reading of a field called
+`id` — merged the two into one, and the concatenated argument objects were rejected
+before either command ran:
+
+```
+Validation failed for tool "bash": Tool call arguments are not valid JSON.
+Parse Error: Unexpected trailing characters at position 2
+Raw JSON: {}{}
+```
+
+The id is now minted from a process-wide counter, which cannot repeat. The tool name
+is still part of the id so a log line names what was called.
+
+Live, eight turns that each produced two parallel `shell` calls: distinct ids
+(`call_shell_15`, `call_shell_16`), distinct `index`, both argument objects valid.
+The previous code produced one id twice and the client merged them.
+
+`deepseek_web_callid_test.go` fails against the clock-derived id.
+
+### 🐛 fix(changelog): entri pending tidak lagi masuk ke tengah prosa atau di atas judul
+
+Dua cacat pada `internal/changelogfrag/splice`. Keduanya baru terpicu setelah `CHANGELOG.md` menjadi upstream-owned: upstream tidak punya section `## [Unreleased]` setelah rilis, jadi jalur *fallback*-nya terpakai di **setiap** request.
+
+- **Judul `# Changelog` terdorong ke bawah.** Jalur fallback menyisipkan blok `## [Unreleased]` di offset 0, jadi dokumen yang dirender terbuka dengan `## [Unreleased]` dan judulnya seolah menjadi heading milik entri pending. Sekarang blok itu mendarat tepat di bawah judul (`prependAfterTitle`), dan seluruh section rilis tetap di bawahnya.
+- **Heading yang hanya dikutip di prosa dianggap section.** `splice` mencari `## [Unreleased]` dengan `strings.Index`, sedangkan catatan rilis v1.9.11 menulis heading itu di tengah kalimat ("baris 5-6 (`## [Unreleased]` + entry pertama)"). Akibatnya setiap fragment disisipkan ke tengah bullet catatan rilis dan kalimatnya terpotong. `findUnreleasedHeading` sekarang menuntut heading sebagai **satu baris utuh** (`\r` di ujung ditoleransi karena working tree di-checkout CRLF).
+- **Ketahuan dari CI, bukan dari mata.** Suite integrasi (`TestChangelogShowsPendingFragments`) menuntut dokumen `/api/changelog` tetap diawali `# Changelog` dan tetap memuat section rilis. Test itu gagal di CI untuk `583de20` dan `94f081d` **sementara `go test ./...` lokal tetap hijau**, karena suite integrasi hanya jalan dengan build tag.
+- **Diverifikasi dengan kontrol negatif, bukan cukup "hijau".** Tiap perbaikan dibalikkan lebih dulu: tanpa anchoring, test mencetak output dengan kalimat terpotong dan `### chat fix` di dalam bullet list; tanpa `prependAfterTitle`, `TestAssembleKeepsTitleAbovePendingEntries` gagal karena dokumen terbuka dengan `## [Unreleased]`. Setelah keduanya dipulihkan, `go test ./...`, `go vet -tags=integration ./...`, dan `go test -tags=integration ./internal/integration/...` (79,6s + bootfx 15,7s) semuanya hijau.
+- **Ini juga bug upstream.** `upstream/main` punya 3 fragment dan nol heading `[Unreleased]` nyata, jadi changelog upstream sedang salah sisip dengan cara yang sama — dan `upstream` juga mengalami kehilangan judul yang sama. Bila upstream memperbaiki fungsi ini sendiri, `fragments.go` akan muncul di daftar "your version won" milik `scripts/sync-upstream.sh`; baca diff-nya saat itu muncul.
+
+### 🔧 chore(fork): `CHANGELOG.md` kembali milik upstream
+
+- **Masalahnya.** Upstream menulis ulang `CHANGELOG.md` secara borongan saat rilis: `make changelog-merge` memasukkan seluruh fragment `.changes/` di bawah heading `## [TAG]` baru lalu mengosongkan folder itu. Selama fork menyimpan editan di file itu, **setiap** section rilis baru akan bentrok, dan `-X ours` menyelesaikannya dengan mempertahankan salinan fork — artinya catatan rilis upstream hilang tanpa suara dan changelog fork membeku.
+- **Drift yang sudah terjadi.** Blok `## [Unreleased]` fork adalah duplikat 860 baris dari konten yang sudah dirilis upstream (v1.9.10/v1.9.6/v1.9.5 — setiap heading muncul dua kali di file), dan fork sama sekali belum punya `## [v1.9.11] - 2026-10-12`. Jadi file itu sekaligus terlalu panjang dan ketinggalan.
+- **Diverifikasi tidak merugikan.** Membandingkan seluruh file baris per baris dengan `CHANGELOG.md` upstream: dari 4166 baris non-kosong, hanya **5 baris** yang khas fork — catatan implementasi pada dua entry yang sudah dirilis. Kelimanya dipindahkan lebih dulu ke `.changes/284-fork-changelog-notes.md`, baru file-nya diambil dari upstream, sehingga tidak ada yang hilang. Sekarang blob-nya identik dengan `upstream/main` dan `## [v1.9.11]` ada.
+- **Aturannya sekarang sama dengan `ci.yml`:** `CHANGELOG.md` milik upstream, entri fork hanya hidup di fragment `.changes/` — persis aturan `AGENTS.md` §7.6 untuk pull request. Fragment adalah file yang tidak ada di upstream, jadi tidak mungkin bentrok. `scripts/sync-upstream.sh` menegakkan keduanya lewat `same_as_upstream`, sehingga drift dilaporkan alih-alih dibiarkan.
+- **Efek sampingnya jujur:** kalau `make changelog-merge` dijalankan di fork ini, skrip sync akan melaporkan drift pada `CHANGELOG.md`. Itu memang disengaja — keputusan sadar, bukan bug. Tidak ada kode, workflow, atau perilaku runtime yang berubah; ini murni kebersihan changelog dan pencegahan kehilangan data saat sync.
+
+### 📝 Catatan implementasi fork — Auto Group combos by model family
+
+- Fixed a latent bug the new feature exposed: `isLlmCombo` rejected any `kind !== 'llm'`, so the auto free-tier combo was invisible on the combos page. It now accepts the `auto-*` kinds while still excluding the upstream `search-combo` media combos.
+
+### 📝 Catatan implementasi fork — dashboard backup import
+
+- `ProfileSettingsView.svelte` posted the chosen file as **`multipart/form-data`**, but `HandleImportDatabase` (like upstream `src/app/api/settings/database/route.js`) does `request.json()` on the body, so every import died at the decode with HTTP 400 and the user saw "Failed to import database: Import failed with status 400". The client now reads `file.text()`, `JSON.parse`s it, and PUTs the raw JSON body — verified against `E:\9router-backup-2026-09-25T15-07-00-715Z.json`.
+- The destructive op also re-authenticates against the stored bcrypt hash, and the client never sent a password at all: once a dashboard password was set, import (and the plain anchor-click export, which is likewise an `x-9r-password`-gated route) returned 401. Upstream prompts in a modal first; the port now does the same — both buttons open a password modal, and the password travels in the `x-9r-password` header, matching upstream exactly.
+- Backup filename stamp regained full precision (`T15-07-00-715Z` instead of `T00-00-00-000Z`-style day-only), matching upstream's `toISOString().replace(/[.:]/g, '-')`.
+- Server side accepts the password from **either** the body field or the header, so the pre-existing body-embedded contract keeps working; `TestHandleImportDatabase_ClientContract` pins both the multipart rejection and the header auth. The upstream post-import `applyOutboundProxyEnv` has no Go equivalent yet (no `outboundProxyUrl` handling exists in this runtime), so it is noted in a comment rather than faked.
+
+> These bullets describe **this fork's** implementation of two entries that
+> upstream has already released (v1.9.6 and v1.9.5). They existed only inside the
+> stale `## [Unreleased]` block that duplicated already-released content, so they
+> are moved here before `CHANGELOG.md` is taken back to upstream's own version.
+> Without this file the next sync would have dropped them, silently — see
+> `docs/FORK_SYNC.md`. Both entries themselves are unchanged and remain in
+> upstream's release sections.
+
+### 🔧 chore(fork): sync from upstream without clobbering fork changes
+
+- **The problem this closes.** An earlier sync of this fork used
+  `git checkout --theirs` on every conflict, which resolves each one by throwing
+  away *this* side. It silently deleted the `docker-publish` job from `ci.yml` —
+  the workflow still parsed and looked correct, and the only symptom was that
+  nothing was ever published again. Nothing in the repo checked for it, so
+  nothing caught it.
+- **`scripts/sync-upstream.sh`** replaces that. It merges `upstream/main` with
+  `-X ours` (non-conflicting upstream work merges in; conflicting work keeps this
+  fork's side), guards the two states where a bad merge costs uncommitted work
+  (dirty tree, merge in progress), leaves a `backup/pre-sync-<stamp>` branch, and
+  verifies the fork's customisations are still present before declaring success.
+- **Why `-X ours` and not `-X theirs` is measured, not asserted.** Against a
+  simulated upstream commit with a real conflict in `ci.yml`, one in `routes.go`,
+  and a non-conflicting new file: `-X theirs` lost the fork's `docker-publish`
+  while `-X ours` kept it; `-X ours` dropped upstream's new job and its
+  `routes.go` edit. The script prints that dropped-file list, because `-X ours`
+  resolves without conflict markers and the cost is otherwise invisible.
+- **The invariant set is written as assertions** (the `docker-publish` job and
+  `REGISTRY_IMAGE`, the `url.PathUnescape` fix, the `combos/auto-optimal` route,
+  `upsertFamilyCombos`, `onAutoOptimalClick`, `buildAutoOptimalCombos`), so a
+  future sync that removes one fails loudly with the exact `git reset --hard`
+  command instead of shipping quietly.
+- **The compile check needed a fix to be honest.** `web/dist` is gitignored, so on
+  a fresh clone `go build ./...` fails inside `web/embed.go` before it ever looks
+  at the merge — a red build that says nothing about the sync. The script stands
+  in a throwaway `web/dist/index.html` so the check tests the merge, then removes
+  it. `SKIP_BUILD=1` opts out.
+- **Documented** in `docs/FORK_SYNC.md`, including the two things not to do
+  (`git pull -X theirs`, GitHub's "Sync fork" button — it merges server-side,
+  where `-X ours` does not apply) and how to shrink the conflicting surface.
+- **Verified:** both paths exercised end-to-end on a clone of this repository
+  against a simulated upstream. Happy path — merge succeeds, all eight invariants
+  hold, `docker-publish` survives, upstream's non-conflicting file arrives,
+  backup branch created, dropped files listed, `go build ./...` clean. Failure
+  path — with an invariant genuinely missing, exit code `1` and the correct
+  `git reset --hard backup/pre-sync-…` recovery command. No upstream file is
+  changed by this entry; the script and doc are new files that cannot conflict.
+
+### 🚀 ci(workflows): publish the Docker image to `lautdalam/9router-go` on every push to main
+
+- **Registry repointed.** `release.yml`'s `REGISTRY_IMAGE` and the new publish workflow's `REGISTRY_IMAGE` are both `lautdalam/9router-go`. Nothing in `.github/` or `scripts/` still names `luqmenul/9router-go`.
+- **New `.github/workflows/docker-publish.yml`.** A push to `main` now builds and pushes multi-arch (`linux/amd64,linux/arm64`) to Docker Hub with three tags: `latest` (what a bare `docker pull` resolves, so it follows main), the branch name, and `sha-<short>` (the only tag never rewritten, so a running container stays traceable to a commit). Pushing to a repository that does not exist yet creates it.
+- **Why its own file, and why `workflow_run` rather than `push`.** The tests have to pass before anything is published — putting a red commit on `latest` is how a broken gateway reaches whoever just pulled it — and a job cannot gate a workflow it is not part of. `on: workflow_run` of the `CI` workflow on `main` with `conclusion == 'success'` gives that guarantee without adding a single line to a file upstream owns: `workflow_run` fires only when CI has completed successfully, and `branches: [main]` excludes the PR runs, so a pull request still cannot publish. Keeping the job out of `ci.yml` also means upstream's own CI changes merge cleanly instead of colliding with an appended job — the fork's sync script now asserts `ci.yml` is byte-identical to upstream's. Upstream's `docker` verify job is untouched: still un-gated, still `load: true` with no push, so a Dockerfile break stays visible on a PR whose tests are failing.
+- **`sha-<short>` is computed, not taken from `docker/metadata-action`.** For a `workflow_run` event `{{sha}}` (and `github.sha`) is the default branch as of delivery time, not the commit CI verified, so the one tag whose entire purpose is traceability would have pointed at the wrong commit. The tag list is built from `github.event.workflow_run.head_sha` directly, which also drives `actions/checkout`, so the image and the tag always describe the same commit.
+- **A missing `docker/setup-qemu-action` was found and fixed before it could fail.** The multi-arch build needs a binfmt handler for the foreign architecture; without QEMU, BuildKit fails the arm64 half. `release.yml` has always set it up; the publish job did not, and the sync script now asserts it is present so removing it fails a sync rather than a release.
+- **Two related identity bugs fixed, because the change would otherwise be half-done.** `scripts/notify-telegram.sh` told readers to `docker pull luqmenul/9router-go` and linked to `github.com/luqman-v1/9router-go/releases/tag/${TAG}` — but the release page is created in whichever repository ran the workflow, so from this fork the announcement both named an image the release did not write and linked to a release page that does not exist. The image now comes from `DOCKER_IMAGE`, which `release.yml` sets from `${{ env.REGISTRY_IMAGE }}` (single source of truth, cannot drift again), and the URL is derived from `GITHUB_REPOSITORY`. `release.yml`'s tag trigger and multi-arch build are unchanged.
+- **Required setup, and it fails loudly if missing.** The fork needs two repository secrets: `DOCKERHUB_USERNAME` (= `lautdalam`) and `DOCKERHUB_TOKEN` (a Docker Hub access token with **Read & Write**). Without them the publish job goes red on the next push to main — deliberately, rather than skipping in silence and leaving you believing images are being published when they are not.
+- **Verified:** both workflows parse (`Bun.YAML.parse`); the tag computation was executed as a shell snippet with a fixture SHA and branch to confirm it emits `lautdalam/9router-go:latest,lautdalam/9router-go:main,lautdalam/9router-go:sha-<7>`, and that the 7-character short SHA is what lands; a structural assertion pass confirms the trigger (`workflow_run` on `CI`, `branches: [main]`), the `conclusion == 'success'` gate, `push: true`, the platform pair, the preserved setup-qemu step, that `actions/checkout` uses `head_sha`, and that upstream's `ci.yml` verify job and its PGO assertion are intact; `git ls-tree` confirms `ci.yml`'s blob is byte-identical to `upstream/main`'s again; a `grep` proves no `luqmenul` remains under `.github/` or `scripts/`.
+- **Not yet done, and deliberately so:** the Dockerfile stages do not cross-compile (`web-builder` and `builder` run on the target platform instead of `--platform=$BUILDPLATFORM` with `GOARCH=$TARGETARCH`), so the arm64 half of each push is built under QEMU — minutes per push rather than seconds. Fixing that needs a Docker-capable machine to verify, which is why it is left out of this change.
+  Also unverified: the workflows have never run on GitHub from this machine (push is still blocked by credentials), so the first green `CI` → publish cycle is still to be observed.
+
+### 🐛 fix(dashboard): combos whose id needs percent-encoding could not be deleted
+
+- **Symptom.** Two combos refused to delete from the dashboard. Clicking Delete reported success, the card disappeared, and the combo came back on the next refresh — with nothing in the log to explain it.
+- **Which two, and why only two.** `Auto: @cf/meta/llama-70b-instruct-fp8-fast` and `Auto: @cf/moonshotai/kimi`. Those are the Cloudflare Workers AI families, and `@` is the only character in a generated id the browser percent-escapes. Every other `auto-family-*` id is already URL-safe, which is exactly why the bug looked arbitrary rather than systemic.
+- **Root cause.** `combos/{id}` is a chi route, and chi matches against `r.URL.RawPath` as soon as it differs from `r.URL.Path` — matching the *escaped* path. The captured parameter is the matched text verbatim and neither chi nor `getURLParam` decoded it, so with the client sending `encodeURIComponent(id)` the handler received `auto-family-%40cf/moonshotai/kimi`, ran `DELETE FROM combos WHERE id = ?` against an id that does not exist, and still answered `200 {"status":"ok"}`. A delete that succeeds, changes nothing, and reports success.
+- **Fix.** `getURLParam` now runs `url.PathUnescape` on the parameter, so the handler sees the id the caller meant. The decode is guarded: a value that is not a valid escape sequence is passed through unchanged rather than dropped, so a routing miss can never be turned into a wrong-but-plausible id. The fix is in the shared helper, so `PUT /api/combos/{id}` and every other escaped-id route are covered by the same change.
+- **Verified by reproduction, not by inspection.** Against a running instance: `DELETE .../auto-family-%40cf-meta-llama-70b-instruct-fp8-fast` returned `200` and the row survived (the echoed id was still `%40`-encoded, which is what gave the mechanism away); the same request with a literal `@` deleted the row. `TestDeleteComboPathEscaping` now pins both cases through the real router, and asserts the row is gone rather than trusting the status code — the whole failure mode is a 200 that deletes nothing. The test fails on the pre-fix code (`combo "auto-family-@cf/moonshotai/kimi" survived DELETE`) and passes after it.
+- **No data migration needed.** The two stuck rows are ordinary rows; they delete normally once the server is running this fix.
+
+### ✨ feat(dashboard): one-click **Auto Optimal** combo builder
+
+- **The gap.** `POST /api/combos/auto-free` and `POST /api/combos/auto-family` existed but were **not wired to any button** — `CombosView.svelte` rendered `<CombosHeader onCreateClick={openCreateModal} />` with no auto callbacks, so the header's auto buttons never appeared (`{#if onAutoFreeClick}` was always false). Every combo therefore had to be built by hand.
+- **New endpoint `POST /api/combos/auto-optimal`.** One click writes an **optimal combo set** for the providers the user actually has a connection for: one combo per model family (the same rows Auto Group by Model writes) **plus** a master `Auto: Optimal` fallback chain (stable id `auto-optimal`, kind `auto-optimal`) spanning every usable chat model. Both are upserts, so re-clicking refreshes the rows instead of stacking duplicates.
+- **Ordering is the actual optimisation.** `orderModels()` sorts every chain by, in order: (1) **free tier first** (`IsFreeTierModel`), (2) **quality tier descending** — frontier (`opus`/`pro`/`o3`/`max`/`reasoner`…) before balanced before fast (`mini`/`flash`/`haiku`/`turbo`…), so after a free model fails the next answer is the strongest paid one, not the cheapest, (3) the user's **connection priority** (lower wins), (4) the id itself, for a stable diffable list. `qualityRank()` checks fast tokens before frontier ones so `o3-mini`/`gpt-5.4-mini` classify as fast, and it is a fallback-ordering heuristic only — never a routing decision, and an unknown id lands in the balanced tier rather than being dropped.
+- **Bounded, and honest about it.** The master chain is capped at `optimalMaxModels = 50`; the response carries `truncated: true` and the UI says so, rather than silently narrowing coverage.
+- **Manual creation is untouched.** `POST /api/combos` and the `Create Combo` modal behave exactly as before; the new button is additive. The empty state now also offers `Auto Optimal` next to `Create Combo`.
+- **Shared family upsert.** `upsertFamilyCombos()` is factored out of `HandleAutoFamilyCombos` so the auto-family endpoint and the optimal builder write byte-identical family rows — whichever runs last only changes the ordering, never the set. `combos_family.go` keeps every existing contract.
+- **Verified:** `go build ./...`, `go vet ./internal/handlers/...`, `go test ./internal/handlers/dashboard/...` all green; new table-driven tests cover `qualityRank`, the `orderModels` comparator (free-first, quality, priority, stable tiebreak) and the endpoint (free model leads the chain, families are built, regeneration keeps one master row, no-connection 409). `bun web/scripts/web-build.ts` builds and `make vet-svelte` reports 0 unresolved identifiers at the pinned 83-error baseline.
+
+### Release workflow fails fast when dispatched without a tag
+
+- **The run died minutes in, for a reason the operator could not act on.** `softprops/action-gh-release@v2` derives its ref from `github.ref`, and a `workflow_dispatch` on `main` supplies `refs/heads/main` rather than `refs/tags/...`, so the `Upload binaries to release` job emitted `##[error]⚠️ GitHub Releases requires a tag`. `channel` — which every other job `needs` — deliberately tolerated the non-tag case (`else VERSION="$(cat VERSION)"`), so the workflow went on to build the binaries and the Docker image and only failed once there was nothing left to publish with them.
+- **The `else` branch is now the guard.** A non-tag ref prints three `::error::` lines — which ref was used, why it cannot become a release, and the exact `git tag vX.Y.Z && git push origin vX.Y.Z` to fix it — and exits 1. Because that happens inside `channel`, `binaries`, `docker` and `notify` are all skipped and the run finishes in seconds instead of minutes. The tag path is untouched, so tagging behaves exactly as before.
+- **Why not a `workflow_dispatch` input instead.** A tag input would have to be threaded through `actions/checkout`, `GITHUB_REF_NAME` at three sites, and the Docker tag computation — and a manually typed tag is precisely the mismatch the existing `FILE_VERSION` check exists to catch. The workflow's own comment states the rule it was built on: *"What marks the GitHub Release itself as experimental is what keeps it out of /releases/latest"*. Everything downstream depends on that tag existing, so the honest behaviour is to refuse rather than to guess.
+- **Verified** with `python3 -c "import yaml; yaml.safe_load(open('.github/workflows/release.yml'))"`, `go build ./...`, and the full `go test ./...` suite (4668 tests) green. Workflow-only change — no Go code touched.
+
+### `Race detector` flake in the MiniMax code dedup test fixed
+
+- **The failure was the test, not the code.** CI run 38686850606 failed on `TestRefreshMiniMaxCode_DedupesConcurrentRefreshes` with `token endpoint called 2 times, want 1`, while the plain `test` job passed on the same commit. `refreshMiniMaxCode` already dedupes through `singleflight` (`internal/proxy/oauth/minimax_code.go:26`), but `singleflight` collapses calls that *overlap* — it does not cache a result. The test launched both goroutines with no synchronization, so whenever the first refresh finished its HTTP round trip before the second one reached `singleflight.Do`, the second started a second flight and the endpoint was legitimately hit twice. `-race` widens that window, which is why only the race job tripped.
+- **Overlap is now guaranteed rather than hoped for.** The token endpoint holds the *first* request open on a `release` channel, keeping its flight registered; refresh 0 waits on `inFlight` until it is actually inside the endpoint before refresh 1 is started; refresh 1 then gets a 100 ms window to join the flight and the test reports the dedup as gone if it answers on its own instead. `releaseAll` is deferred after `srv.Close` so it runs first — without that ordering a failing test would block forever in `httptest.Close`.
+- **Verified negatively, not just green.** Bypassing the singleflight in `minimax_code.go` makes the test fail deterministically at `second refresh completed while the first was still held at the token endpoint: the singleflight dedup is gone`; restoring the implementation turns it green. The package then passes at `-count=20`, along with `go build ./...` and the full `go test ./...` suite. Test-only change.
+
+
 ## [v1.9.13] - 2026-10-15
 
 ### OpenCode: append the exact fingerprint even when caller tools collide
