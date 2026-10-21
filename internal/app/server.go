@@ -16,6 +16,7 @@ import (
 	"9router/proxy/internal/config"
 	"9router/proxy/internal/db"
 	"9router/proxy/internal/providers"
+	"9router/proxy/internal/proxy/fetcher"
 	"9router/proxy/internal/proxy/oauth"
 	"9router/proxy/internal/shutdown"
 	"9router/proxy/internal/updater"
@@ -96,6 +97,20 @@ func ProvideServer(p ServerParams) *http.Server {
 			providers.StartBackgroundCatalogSync(shutdown.Context(), nil, catalogPath)
 			oauth.StartBackgroundRefresh(shutdown.Context(), p.Repo)
 			db.StartRetentionLoop(shutdown.Context(), p.Repo, db.DefaultRequestDetailRetention)
+
+			// Start auto proxy pool refresh if enabled
+			if p.Config.ProxyRefreshEnabled {
+				fetcher.StartProxyRefreshLoop(shutdown.Context(), p.Repo, fetcher.RefreshConfig{
+					Enabled:    true,
+					Interval:   p.Config.ProxyRefreshInterval,
+					TopN:       p.Config.ProxyRefreshTopN,
+					PoolName:   "Auto: Stormsia Residential",
+					PoolID:     "stormsia-residential-auto",
+					Concurrency: 5,
+				})
+				log.Printf("[proxy-fetcher] auto-refresh enabled: interval=%s topN=%d",
+					p.Config.ProxyRefreshInterval, p.Config.ProxyRefreshTopN)
+			}
 
 			log.Printf("9router-go Proxy (%s) starting on port %d", updater.CurrentVersion, p.Config.Port)
 

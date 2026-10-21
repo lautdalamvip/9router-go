@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/spf13/viper"
 
@@ -28,6 +29,13 @@ type Config struct {
 	CavemanEnabled  bool
 	PonytailEnabled bool
 	ADHDEnabled     bool
+	// ProxyRefreshEnabled controls whether the gateway automatically fetches
+	// and refreshes residential proxies from stormsia.github.io.
+	ProxyRefreshEnabled bool
+	// ProxyRefreshInterval controls how often the proxy pool is refreshed.
+	ProxyRefreshInterval time.Duration
+	// ProxyRefreshTopN controls how many of the fastest proxies to keep.
+	ProxyRefreshTopN int
 }
 
 // NewViper creates and configures a new Viper instance reading from .env with standard defaults.
@@ -52,6 +60,9 @@ func NewViperWithFile(configFile string) *viper.Viper {
 	v.SetDefault("CAVEMAN_ENABLED", false)
 	v.SetDefault("PONYTAIL_ENABLED", false)
 	v.SetDefault("ADHD_ENABLED", false)
+	v.SetDefault("PROXY_REFRESH_ENABLED", false)
+	v.SetDefault("PROXY_REFRESH_INTERVAL_HOURS", 1)
+	v.SetDefault("PROXY_REFRESH_TOP_N", 15)
 
 	if configFile != "" {
 		if err := v.ReadInConfig(); err != nil {
@@ -204,6 +215,16 @@ func LoadConfigFromViper(v *viper.Viper) *Config {
 	ponytailEnabled := v.GetBool("PONYTAIL_ENABLED")
 	adhdEnabled := v.GetBool("ADHD_ENABLED")
 
+	proxyRefreshEnabled := v.GetBool("PROXY_REFRESH_ENABLED")
+	proxyRefreshInterval := time.Duration(v.GetInt("PROXY_REFRESH_INTERVAL_HOURS")) * time.Hour
+	if proxyRefreshInterval <= 0 {
+		proxyRefreshInterval = 1 * time.Hour
+	}
+	proxyRefreshTopN := v.GetInt("PROXY_REFRESH_TOP_N")
+	if proxyRefreshTopN <= 0 {
+		proxyRefreshTopN = 15
+	}
+
 	return &Config{
 		Host:            host,
 		Port:            port,
@@ -216,6 +237,9 @@ func LoadConfigFromViper(v *viper.Viper) *Config {
 		CavemanEnabled:  cavemanEnabled,
 		PonytailEnabled: ponytailEnabled,
 		ADHDEnabled:     adhdEnabled,
+		ProxyRefreshEnabled:  proxyRefreshEnabled,
+		ProxyRefreshInterval: proxyRefreshInterval,
+		ProxyRefreshTopN:     proxyRefreshTopN,
 	}
 }
 
