@@ -76,9 +76,9 @@ func TestFetchStormsiaProxies_ServerError(t *testing.T) {
 	defer server.Close()
 
 	ctx := context.Background()
-	_, err := FetchStormsiaProxies(ctx, 10)
+	_, err := fetchStormsiaProxiesFrom(ctx, 10, server.URL)
 	if err == nil {
-		t.Error("FetchStormsiaProxies() expected error for server error, got nil")
+		t.Error("fetchStormsiaProxiesFrom() expected error for server error, got nil")
 	}
 }
 
@@ -91,9 +91,9 @@ func TestFetchStormsiaProxies_InvalidJSON(t *testing.T) {
 	defer server.Close()
 
 	ctx := context.Background()
-	_, err := FetchStormsiaProxies(ctx, 10)
+	_, err := fetchStormsiaProxiesFrom(ctx, 10, server.URL)
 	if err == nil {
-		t.Error("FetchStormsiaProxies() expected error for invalid JSON, got nil")
+		t.Error("fetchStormsiaProxiesFrom() expected error for invalid JSON, got nil")
 	}
 }
 

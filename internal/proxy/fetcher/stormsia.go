@@ -24,28 +24,6 @@ type StormsiaProxy struct {
 	Password *string `json:"password"`
 	ExitIP   string  `json:"exit_ip"`
 	Country  string  `json:"country"`
-	ASN      *StormsiaASN      `json:"asn,omitempty"`
-	Geo      *StormsiaGeo      `json:"geolocation,omitempty"`
-}
-
-type StormsiaASN struct {
-	Number       int    `json:"autonomous_system_number"`
-	Organization string `json:"autonomous_system_organization"`
-}
-
-type StormsiaGeo struct {
-	City    map[string]map[string]string `json:"city,omitempty"`
-	Country *StormsiaGeoCountry           `json:"country,omitempty"`
-	Location *StormsiaGeoLocation          `json:"location,omitempty"`
-}
-
-type StormsiaGeoCountry struct {
-	Code string `json:"iso_code,omitempty"`
-}
-
-type StormsiaGeoLocation struct {
-	Latitude  float64 `json:"latitude,omitempty"`
-	Longitude float64 `json:"longitude,omitempty"`
 }
 
 // ProxyURL returns the proxy URL in the format expected by http.ProxyURL
