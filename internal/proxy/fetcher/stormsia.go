@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-// StormsiaProxy represents a proxy from stormsia.github.io/proxy-list/residential
+// StormsiaProxy represents a proxy from stormsia.github.io/proxy-list/proxies.json
 type StormsiaProxy struct {
 	Protocol string  `json:"protocol"`
 	Host     string  `json:"host"`
@@ -23,7 +23,29 @@ type StormsiaProxy struct {
 	Username *string `json:"username"`
 	Password *string `json:"password"`
 	ExitIP   string  `json:"exit_ip"`
-	Country  string  `json:"country"` // ISO code
+	Country  string  `json:"country"`
+	ASN      *StormsiaASN      `json:"asn,omitempty"`
+	Geo      *StormsiaGeo      `json:"geolocation,omitempty"`
+}
+
+type StormsiaASN struct {
+	Number       int    `json:"autonomous_system_number"`
+	Organization string `json:"autonomous_system_organization"`
+}
+
+type StormsiaGeo struct {
+	City    map[string]map[string]string `json:"city,omitempty"`
+	Country *StormsiaGeoCountry           `json:"country,omitempty"`
+	Location *StormsiaGeoLocation          `json:"location,omitempty"`
+}
+
+type StormsiaGeoCountry struct {
+	Code string `json:"iso_code,omitempty"`
+}
+
+type StormsiaGeoLocation struct {
+	Latitude  float64 `json:"latitude,omitempty"`
+	Longitude float64 `json:"longitude,omitempty"`
 }
 
 // ProxyURL returns the proxy URL in the format expected by http.ProxyURL
@@ -52,10 +74,10 @@ type StormsiaResponse struct {
 	Proxies []StormsiaProxy `json:"proxies"`
 }
 
-// FetchStormsiaProxies fetches the proxy list from stormsia.github.io/proxy-list/residential
+// FetchStormsiaProxies fetches the proxy list from stormsia.github.io/proxy-list/proxies.json
 // and returns the top N fastest proxies based on the reported timeout field.
 func FetchStormsiaProxies(ctx context.Context, topN int) ([]StormsiaProxy, error) {
-	return fetchStormsiaProxiesFrom(ctx, topN, "https://stormsia.github.io/proxy-list/residential")
+	return fetchStormsiaProxiesFrom(ctx, topN, "https://stormsia.github.io/proxy-list/proxies.json")
 }
 
 // fetchStormsiaProxiesFrom is the internal implementation that accepts a custom URL for testing.
