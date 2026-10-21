@@ -780,6 +780,23 @@
            its own submenu, not one more verb in this list. -->
       <div class="flex flex-wrap items-center gap-2">
 
+        <Button
+          size="sm"
+          variant="secondary"
+          onclick={async () => {
+            try {
+              await api.refreshStormsiaProxies()
+              notifications.success('Stormsia proxies refreshed successfully')
+              await fetchProxyPools()
+            } catch (err) {
+              notifications.error(err instanceof Error ? err.message : 'Failed to refresh Stormsia proxies')
+            }
+          }}
+        >
+          <span class="material-symbols-outlined text-[18px]">download</span>
+          Get Proxies from Stormsia
+        </Button>
+
         <div class="relative" bind:this={relayMenuRef}>
           <Button
             size="sm"

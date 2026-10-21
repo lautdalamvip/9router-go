@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"9router/proxy/internal/db"
+	"9router/proxy/internal/proxy/fetcher"
 	"9router/proxy/internal/handlerutil"
 	"9router/proxy/internal/providers"
 )
@@ -409,4 +410,105 @@ func (h *DashboardHandler) testRelayPool(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	finish(true, "")
+}
+
+// HandleStormsiaRefresh handles POST /api/proxy-pools/stormsia/refresh.
+// It fetches residential proxies from stormsia.github.io, speed-tests them,
+// and updates the auto-generated proxy pool.
+func (h *DashboardHandler) HandleStormsiaRefresh(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	// Fetch proxies from stormsia
+	proxies, err := fetcher.FetchStormsiaProxies(ctx, 15)
+	if err != nil {
+		handlerutil.WriteJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to fetch proxies: %v", err))
+		return
+	}
+
+	if len(proxies) == 0 {
+		handlerutil.WriteJSONError(w, http.StatusInternalServerError, "no valid proxies found")
+		return
+	}
+
+	// Speed test proxies concurrently
+	results := fetcher.SpeedTestProxies(ctx, proxies, h.primaryProbeURL(), 5)
+	fetcher.SortByLatency(results)
+	alive := fetcher.AliveProxies(results)
+
+	if len(alive) == 0 {
+		handlerutil.WriteJSONError(w, http.StatusInternalServerError, "no alive proxies found after speed test")
+		return
+	}
+
+	// Build pool data
+	poolData := fetcher.ToProxyPoolData("Auto: Stormsia Residential", alive)
+	if poolData == nil {
+		handlerutil.WriteJSONError(w, http.StatusInternalServerError, "failed to build pool data")
+		return
+	}
+
+	// Add metadata
+	poolData["source"] = "stormsia-auto"
+	poolData["refreshedAt"] = time.Now().UTC().Format(time.RFC3339)
+	poolData["totalTested"] = len(proxies)
+	poolData["aliveCount"] = len(alive)
+
+	poolID := "stormsia-residential-auto"
+
+	// Check if pool exists
+	existing, err := h.Repo.GetProxyPool(poolID)
+	if err != nil || existing == nil {
+		// Create new pool with fixed ID
+		dataBytes, _ := json.Marshal(poolData)
+		now := time.Now().UTC().Format(time.RFC3339)
+		_, err := h.Repo.RawDB().Exec(
+			`INSERT INTO proxyPools (id, isActive, testStatus, data, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)`,
+			poolID, 1, "passed", string(dataBytes), now, now,
+		)
+		if err != nil {
+			handlerutil.WriteJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to create pool: %v", err))
+			return
+		}
+	} else {
+		// Update existing pool
+		updates := map[string]any{
+			"name":      poolData["name"],
+			"urls":      poolData["urls"],
+			"type":      poolData["type"],
+			"strategy":  poolData["strategy"],
+			"isActive":  true,
+			"testStatus": "passed",
+		}
+		if source, ok := poolData["source"].(string); ok {
+			updates["source"] = source
+		}
+		if refreshedAt, ok := poolData["refreshedAt"].(string); ok {
+			updates["refreshedAt"] = refreshedAt
+		}
+		if totalTested, ok := poolData["totalTested"].(int); ok {
+			updates["totalTested"] = totalTested
+		}
+		if aliveCount, ok := poolData["aliveCount"].(int); ok {
+			updates["aliveCount"] = aliveCount
+		}
+		if err := h.Repo.UpdateProxyPool(poolID, updates); err != nil {
+			handlerutil.WriteJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to update pool: %v", err))
+			return
+		}
+	}
+
+	// Update test status for each proxy
+	for _, result := range alive {
+		_ = h.Repo.SetProxyPoolStatus(poolID, "passed", fetcher.LatencyMs(result.Latency))
+	}
+
+	handlerutil.WriteJSON(w, http.StatusOK, map[string]any{
+		"success":     true,
+		"poolId":      poolID,
+		"poolName":    poolData["name"],
+		"totalFetched": len(proxies),
+		"aliveCount":  len(alive),
+		"urls":        poolData["urls"],
+		"message":     fmt.Sprintf("Successfully fetched %d proxies, %d alive", len(proxies), len(alive)),
+	})
 }

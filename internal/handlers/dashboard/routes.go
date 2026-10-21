@@ -103,6 +103,7 @@ func RegisterRoutes(r chi.Router, h *DashboardHandler) {
 		r.Put("/proxy-pools/{id}", h.HandleUpdateProxyPool)
 		r.Delete("/proxy-pools/{id}", h.HandleDeleteProxyPool)
 		r.Post("/proxy-pools/{id}/test", h.HandleTestProxyPool)
+		r.Post("/proxy-pools/stormsia/refresh", h.HandleStormsiaRefresh)
 
 		// API Keys
 		r.Get("/keys", h.HandleGetApiKeys)
