@@ -63,6 +63,17 @@ var (
 type LiveCapabilities struct {
 	Thinking bool `json:"thinking"`
 	Agentic  bool `json:"agentic"`
+
+	// A catalogue may also state the model's real windows and effort levels.
+	// Carrying them here lets the listing publish the provider's own numbers,
+	// so no client has to hard-code an override for a model the provider
+	// already describes.
+	Vision             bool     `json:"vision,omitempty"`
+	ContextWindow      int      `json:"contextWindow,omitempty"`
+	MaxOutput          int      `json:"maxOutput,omitempty"`
+	ThinkingLevels     []string `json:"thinkingLevels,omitempty"`
+	ThinkingDefault    string   `json:"thinkingDefault,omitempty"`
+	ThinkingCanDisable bool     `json:"thinkingCanDisable,omitempty"`
 }
 
 // LiveModel is one entry of a provider's live catalog.
@@ -72,6 +83,11 @@ type LiveModel struct {
 	ContextLength int
 	MaxOutput     int
 	Capabilities  *LiveCapabilities
+	// LimitsAuthoritative marks a catalogue whose ContextLength/MaxOutput are
+	// the provider's own numbers for this exact model, not a best guess. They
+	// then outrank the static substring table, which only knows model families
+	// and would otherwise report a neighbouring model's window.
+	LimitsAuthoritative bool
 }
 
 type liveCatalogEntry struct {
@@ -115,6 +131,10 @@ func (h *ChatHandler) resolveLiveCatalog(ctx context.Context, conn *models.Provi
 		fetch = func(ctx context.Context, token string) []LiveModel {
 			return h.fetchGrokCLILiveCatalog(ctx, conn, connData, token)
 		}
+	case providerID == "zed":
+		fetch = func(ctx context.Context, token string) []LiveModel {
+			return h.fetchZedLiveCatalog(ctx, conn, connData, token)
+		}
 	case isCompatibleProviderID(providerID):
 		// Upstream fetchCompatibleModelIds: custom nodes publish whatever their
 		// own /models endpoint reports.
@@ -137,11 +157,18 @@ func (h *ChatHandler) resolveLiveCatalog(ctx context.Context, conn *models.Provi
 		if cached, ok := liveCatalogCached(cacheKey); ok {
 			return cached, nil
 		}
-		discovered := fetch(ctx, accessToken)
+		// The flight is shared across callers, so the work inside it must not
+		// inherit the leader's cancellation: one client disconnecting would
+		// otherwise cancel the fetch for every waiter, and an empty result
+		// caches nothing, so the next dashboard poll repeats the whole call.
+		// Detaching leaves each fetch's own liveCatalogFastHTTP timeout as the
+		// only bound on the request.
+		flightCtx := context.WithoutCancel(ctx)
+		discovered := fetch(flightCtx, accessToken)
 		if len(discovered) == 0 && liveCatalogRefreshToken(conn) != "" {
 			// Upstream refreshes the credential on 401/403 and retries once.
 			if refreshed, _, rErr := h.forceRefreshOAuthToken(conn.ID); rErr == nil && refreshed != "" {
-				discovered = fetch(ctx, refreshed)
+				discovered = fetch(flightCtx, refreshed)
 			} else if rErr != nil {
 				log.Warn("models", "live catalog token refresh failed", "provider", providerID, "conn", conn.ID, "error", rErr)
 			}

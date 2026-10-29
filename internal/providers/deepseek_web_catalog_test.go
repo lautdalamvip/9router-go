@@ -1,6 +1,9 @@
 package providers
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // The browser-login providers are distinct deployments reached with a credential
 // a browser session produces, not an API key. Each test below pins a contract a
@@ -34,7 +37,15 @@ func TestBrowserLoginProvidersInCatalog(t *testing.T) {
 			id:      "gemini-web",
 			baseURL: "https://gemini.google.com/app",
 			alias:   "gweb",
-			models:  []string{"gemini-3.1-pro", "gemini-3.7-flash", "gemini-3.1-flash-lite"},
+			// Both naming forms the site's registry produces: the category name
+			// (the stable one) and the display form carrying the version. The
+			// served set is decided live per session, so what is pinned here is
+			// only which names resolve, not which succeed.
+			models: []string{
+				"gemini-3.1-pro", "gemini-3.7-flash", "gemini-3.1-flash-lite",
+				"gemini-pro", "gemini-flash", "gemini-flash-lite", "gemini-argon",
+				"gemini-3-pro", "gemini-4-argon",
+			},
 		},
 	}
 
@@ -127,4 +138,60 @@ func TestBrowserLoginProvidersAreIsolated(t *testing.T) {
 	if KnownProviders["gemini-web"].BaseURL == KnownProviders["gemini"].BaseURL {
 		t.Error("gemini-web and gemini share a base URL")
 	}
+}
+
+// TestGeminiWebIsReachableWithoutACredential pins the property that makes this
+// provider plug-and-play: the site answers an anonymous client.
+//
+// A connection with no key is only allowed through when the catalog declares
+// NoAuth, so a change that drops the flag takes the provider from working to
+// "no API key found" with nothing else in the diff to explain it.
+func TestGeminiWebIsReachableWithoutACredential(t *testing.T) {
+	cfg, ok := KnownProviders["gemini-web"]
+	if !ok {
+		t.Fatal("KnownProviders has no gemini-web entry")
+	}
+	if !cfg.NoAuth {
+		t.Error("gemini-web must be NoAuth: gemini.google.com serves an anonymous session")
+	}
+	if cfg.DefaultAPIKey == "" {
+		t.Error("gemini-web must carry a default key, or the router refuses a connection with no credential")
+	}
+}
+
+// TestGeminiWebAdvertisesOnlyWhatTheWebSurfaceHas pins the capability
+// override.
+//
+// The generic `*gemini-3*` pattern row describes the API surface and grants
+// vision, audio, video and search. The web surface takes an image but has
+// neither audio, video nor a search toggle the executor can set, and a client
+// that sees those flags set will send a request the provider cannot serve.
+func TestGeminiWebAdvertisesOnlyWhatTheWebSurfaceHas(t *testing.T) {
+	for _, model := range GetProviderModels("gemini-web") {
+		caps := GetCapabilitiesForModel("gemini-web", model)
+		if !caps.Vision {
+			t.Errorf("%s: the site's own composer takes an image, so vision must be advertised", model)
+		}
+		if caps.AudioInput || caps.VideoInput {
+			t.Errorf("%s: audio and video input flags must be false on the web surface; got %+v", model, caps)
+		}
+		if !caps.Tools {
+			t.Errorf("%s: tool calling is supported through the prompt and must be advertised", model)
+		}
+		if caps.ThinkingFormat != "gemini-level" {
+			t.Errorf("%s: ThinkingFormat = %q, want gemini-level (the site's own enum)", model, caps.ThinkingFormat)
+		}
+		// A Lite model does not think: the site's registry publishes no
+		// reasoning level for it. Advertising one would send a level the
+		// model cannot serve, and the site answers such a request with a
+		// different model.
+		if isGeminiWebLiteModel(model) && caps.Reasoning {
+			t.Errorf("%s: a Lite model has no reasoning level, so reasoning must not be advertised", model)
+		}
+	}
+}
+
+// isGeminiWebLiteModel reports whether a catalogued name is a Lite model.
+func isGeminiWebLiteModel(model string) bool {
+	return strings.Contains(strings.ToLower(model), "lite")
 }

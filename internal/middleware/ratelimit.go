@@ -15,6 +15,7 @@ import (
 	"9router/proxy/internal/log"
 	"9router/proxy/internal/models"
 	"9router/proxy/internal/observ"
+	"9router/proxy/internal/policy"
 )
 
 // RateLimiter implements per-key rate limiting with sliding window RPM,
@@ -42,6 +43,10 @@ type RateLimiter struct {
 	// key costs a 429, not one goroutine per caller. It is a field, not a
 	// constant, so a test can shrink it.
 	maxQueueDepth int
+	// plans resolves the plan template assigned to a key (F-3). Atomic so a
+	// late wiring call cannot race a request in flight; nil means the install
+	// has no plan tier, which is every setup that has not configured one.
+	plans atomic.Pointer[policy.PlanSource]
 }
 
 // waitQueue is the FIFO of parked requests for one key.
@@ -89,6 +94,28 @@ func NewRateLimiter(window time.Duration) *RateLimiter {
 		maxKeys:       10000,
 		maxQueueDepth: DefaultMaxQueueDepth,
 	}
+}
+
+// SetPlanSource wires the plan tier (F-3). Call it before the first request;
+// the atomic pointer keeps a later rewiring safe for readers already resolving
+// a key.
+func (rl *RateLimiter) SetPlanSource(src policy.PlanSource) {
+	if rl == nil {
+		return
+	}
+	rl.plans.Store(&src)
+}
+
+// planSource returns the wired plan source, or nil when none was set.
+func (rl *RateLimiter) planSource() policy.PlanSource {
+	if rl == nil {
+		return nil
+	}
+	p := rl.plans.Load()
+	if p == nil {
+		return nil
+	}
+	return *p
 }
 
 // Check verifies if a request is allowed under the given limits.
@@ -670,7 +697,7 @@ func RequireRateLimit(rl *RateLimiter, defaults Defaults, usage TokenUsageReader
 				return
 			}
 
-			limits := limitsFor(apiKey, defaults)
+			limits := limitsFor(apiKey, defaults, rl.planSource())
 
 			// Lifetime token quota: a hard budget, refused with 403 the same way
 			// a not-yet-ported plan-tier cap would be. It is checked before
@@ -728,6 +755,175 @@ func RequireRateLimit(rl *RateLimiter, defaults Defaults, usage TokenUsageReader
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// Provider-scope admission.
+//
+// The same limiter serves a second scope. A custom provider is one providerNodes
+// row — a single upstream endpoint shared by every connection under it — so what
+// it tolerates is a property of that endpoint, not of the key calling it. Rather
+// than a second limiter (two copies of the sliding window and the FIFO queue,
+// free to drift apart), a provider's slot lives in these same maps under a
+// namespaced key.
+//
+// Precedence is deliberately key-first: the middleware refuses a caller that has
+// spent its own allowance before a provider slot is ever considered, so one
+// misbehaving caller cannot consume the capacity every other caller depends on.
+
+// ProviderScopeKey namespaces one provider's slot inside the shared limiter maps.
+func ProviderScopeKey(providerID string) string { return "prov:" + providerID }
+
+// EstimatePromptTokens exposes the limiter's own estimator, so a provider's TPM
+// bucket is charged from the same number a key's is.
+func EstimatePromptTokens(body []byte) int { return estimatePromptTokens(body) }
+
+// ProviderRefusal says why one provider attempt was refused.
+type ProviderRefusal struct {
+	// Axis is the limit that refused: "tpm", "rpm" or "concurrency".
+	Axis string
+	// RetryAfter is how long to wait before trying this provider again. For a
+	// queue timeout it is the wait that just elapsed; for TPM it is how long the
+	// bucket needs to refill enough for this request.
+	RetryAfter time.Duration
+	// Limit is the configured value that refused, for the response body.
+	Limit int
+}
+
+// ProviderSlot is one admitted provider attempt. Release ends it and must run
+// when the attempt ends — success, failure, or failover to another candidate.
+type ProviderSlot struct {
+	rl       *RateLimiter
+	key      string
+	tpm      int
+	reserved int
+	held     bool
+}
+
+// Settle reconciles the TPM charge with what the turn actually cost. Only an
+// under-estimate is corrected, exactly as for a key: refunding a surplus would
+// let a caller bank headroom by over-stating its prompt.
+func (s *ProviderSlot) Settle(actual int) {
+	if s == nil || s.rl == nil {
+		return
+	}
+	if s.tpm > 0 && s.reserved > 0 {
+		s.rl.SettleTokenUsage(s.key, s.tpm, s.reserved, actual)
+	}
+	s.reserved = 0
+}
+
+// Release gives back whatever the attempt still holds: the concurrency slot, and
+// any TPM charge the meter never settled. An unsettled charge belongs to an
+// attempt that ended before it produced a usage reading — an upstream error, or a
+// client that hung up — and keeping it would spend a provider's budget on a turn
+// nobody was served.
+func (s *ProviderSlot) Release() {
+	if s == nil || s.rl == nil {
+		return
+	}
+	if s.held {
+		s.rl.ReleaseConcurrency(s.key)
+		s.held = false
+	}
+	if s.reserved > 0 {
+		s.rl.RefundTPM(s.key, s.tpm, s.reserved)
+		s.reserved = 0
+	}
+}
+
+// AcquireProvider admits one attempt against a provider's limits.
+//
+// A nil slot with a nil refusal means the provider declares no limits: the
+// attempt proceeds and there is nothing to release, which is why every caller can
+// hand the slot to a deferred Release unconditionally.
+//
+// A refusal is not an error to report to the client yet. It names this candidate
+// as full; the caller moves to the next candidate and only answers 429 when none
+// is left (docs/provider-limits-plan.md D7).
+func (rl *RateLimiter) AcquireProvider(ctx context.Context, providerID string, limits Limits, promptTokens int) (*ProviderSlot, *ProviderRefusal) {
+	if rl == nil || providerID == "" {
+		return nil, nil
+	}
+	if limits.RPM <= 0 && limits.TPM <= 0 && limits.Concurrency <= 0 {
+		return nil, nil
+	}
+	key := ProviderScopeKey(providerID)
+	slot := &ProviderSlot{rl: rl, key: key, tpm: limits.TPM}
+
+	// TPM first, and not queueable: a token bucket refills continuously, so a
+	// request parked for one could be admitted and immediately re-refused.
+	if limits.TPM > 0 && promptTokens > 0 {
+		if allowed, retryAfterSeconds, axis := rl.checkTPMOnly(key, limits.TPM, promptTokens); !allowed {
+			return nil, &ProviderRefusal{
+				Axis:       axis,
+				Limit:      limits.TPM,
+				RetryAfter: time.Duration(retryAfterSeconds) * time.Second,
+			}
+		}
+		slot.reserved = promptTokens
+	}
+
+	// RPM and concurrency are both queueable here for the same reason as for a
+	// key: the request waits in this provider's FIFO, up to this provider's own
+	// timeout, rather than being refused the moment a burst arrives.
+	waited, ok := rl.Acquire(ctx, key, limits.RPM, limits.Concurrency, limits.QueueTimeout)
+	if !ok {
+		// The TPM charge was taken before the queue and the attempt never left,
+		// so it is not a spend: hand the whole amount back.
+		slot.Release()
+		return nil, &ProviderRefusal{
+			Axis:       queueScope(limits),
+			Limit:      queueLimit(limits),
+			RetryAfter: time.Duration(queueRetryAfter(limits)) * time.Second,
+		}
+	}
+	if waited > 0 {
+		observ.ObserveRateLimitQueueWaitFor("provider", waited.Seconds())
+	}
+	slot.held = limits.Concurrency > 0
+	return slot, nil
+}
+
+// queueLimit names the configured value a queue timeout was waiting on, so the
+// refusal can report the number the operator actually set.
+func queueLimit(limits Limits) int {
+	if limits.Concurrency > 0 {
+		return limits.Concurrency
+	}
+	return limits.RPM
+}
+
+// Snapshot reports the live admission state of a scope key: how many requests sit
+// in its RPM window and how many hold a concurrency slot right now.
+//
+// It exists for the debug trail a refused provider attempt writes. From the
+// refusal alone, "this endpoint is busy" and "this limit is set absurdly low"
+// look identical; these two numbers are what tell them apart, and a queue wait
+// (which leaves no trace in the window) is why the concurrency count is reported
+// even when RPM is the axis that refused.
+//
+// Stale stamps are excluded rather than counted: the window's own pruning happens
+// on the write path, so a count that trusted the slice would report the peak of
+// every window that ever rolled, which is exactly the number that would make an
+// operator raise a limit that is already generous.
+func (rl *RateLimiter) Snapshot(keyID string) (windowCount, active int) {
+	if rl == nil || keyID == "" {
+		return 0, 0
+	}
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	cutoff := time.Now().Add(-rl.window)
+	if w, ok := rl.windows[keyID]; ok {
+		for _, stamp := range w.stamps {
+			if stamp.After(cutoff) {
+				windowCount++
+			}
+		}
+	}
+	if counter, ok := rl.active[keyID]; ok && counter != nil {
+		active = int(atomic.LoadInt32(counter))
+	}
+	return windowCount, active
 }
 
 // checkTPMOnly charges the token bucket and names the refusal when it is full.
@@ -799,14 +995,15 @@ func rejectQuotaExhausted(w http.ResponseWriter, used, quota int) {
 }
 
 // EffectiveTPM returns the TPM limit that applies to a key, resolving the
-// key's column against the operator's global default exactly as the limiter
-// does.
+// key's column against the plan tier and the operator's global default
+// exactly as the limiter does. It is a method so it resolves through the same
+// plan source the limiter charged against.
 //
 // The metering path needs the same number the limiter charged: reconciling the
 // real usage against a different limit would settle the charge into the wrong
 // bucket.
-func EffectiveTPM(d Defaults, apiKey *models.APIKey) int {
-	return limitsFor(apiKey, d).TPM
+func (rl *RateLimiter) EffectiveTPM(d Defaults, apiKey *models.APIKey) int {
+	return limitsFor(apiKey, d, rl.planSource()).TPM
 }
 
 // reservedCtxKey carries the TPM charge the limiter took for this request, and
@@ -872,12 +1069,14 @@ type Limits struct {
 
 // limitsFor resolves the effective limits for a key.
 //
-// The key's own column always wins where it is set; the global default only
-// fills a column the operator left at 0. That ordering is what keeps a global
-// default from quietly capping a key that was deliberately given a higher
-// budget, and from lifting one that was deliberately capped. The plan tier the
-// port plan describes sits between the two and is not implemented yet.
-func limitsFor(apiKey *models.APIKey, d Defaults) Limits {
+// Precedence, least specific first: the operator's global default, the plan
+// assigned to the key, then the key's own column. That ordering is what keeps
+// a global default from quietly capping a key that was deliberately given a
+// higher budget, and lets a plan cap many keys while a single key still
+// escapes its plan without editing the plan for everyone on it.
+//
+// The plan layer comes from policy.Resolve, the one place that merge happens.
+func limitsFor(apiKey *models.APIKey, d Defaults, plans policy.PlanSource) Limits {
 	// A nil Defaults means the operator configured no global fallback, which
 	// is the same as a fallback of zero. Every install without the settings
 	// keys reaches here, so it must not be a nil call.
@@ -885,26 +1084,32 @@ func limitsFor(apiKey *models.APIKey, d Defaults) Limits {
 	if d != nil {
 		out = d()
 	}
-	if v := derefInt(apiKey.RateLimitRPM); v > 0 {
-		out.RPM = v
+	// The plan tier arrives with the key's own overrides already folded in, so
+	// this one value carries the whole precedence rule — global default, then
+	// plan, then key — and the two sources can never be applied in the wrong
+	// order by two call sites.
+	pol := policy.Resolve(plans, apiKey)
+	if pol.RPM > 0 {
+		out.RPM = pol.RPM
 	}
-	if v := derefInt(apiKey.RateLimitTPM); v > 0 {
-		out.TPM = v
+	if pol.TPM > 0 {
+		out.TPM = pol.TPM
 	}
-	if v := derefInt(apiKey.RateLimitConcurrency); v > 0 {
-		out.Concurrency = v
+	if pol.Concurrency > 0 {
+		out.Concurrency = pol.Concurrency
 	}
 	// The quota is a lifetime budget, so it is never taken from the global
-	// fallback: a default token quota would silently cap every key in the
-	// install, which is not what a per-key rate default means.
-	if v := derefInt(apiKey.TokenQuota); v > 0 {
-		out.TokenQuota = v
+	// fallback and never from a plan: a default token quota would silently cap
+	// every key in the install, and a plan's token limit is a per-period
+	// budget the budget engine enforces — a different guarantee.
+	if pol.TokenQuota > 0 {
+		out.TokenQuota = pol.TokenQuota
 	}
 
 	// Queue timeout. The default only applies when the CONCURRENCY cap is the
-	// key's own column. A concurrency cap that arrived from the operator's
-	// global fallback must not silently acquire a 60s queue: on the release
-	// before this change such a key was refused immediately, and turning that
+	// key's own or its plan's: a cap that arrived only from the operator's
+	// global fallback must not silently acquire a 60s queue. On the release
+	// before that change such a key was refused immediately, and turning that
 	// into a minute-long wait is a behaviour change the dashboard cannot show
 	// (the key reads "unset").
 	//
@@ -914,11 +1119,17 @@ func limitsFor(apiKey *models.APIKey, d Defaults) Limits {
 	switch {
 	case keyQueue > 0:
 		// The operator set a queue timeout on the key: honour it, and it
-		// applies whether the concurrency cap is per-key or global.
+		// applies whether the concurrency cap is per-key or from its plan.
 		out.QueueTimeout = time.Duration(keyQueue) * time.Millisecond
 	case keyConc > 0:
 		// The key set its own concurrency cap but no timeout: the documented
 		// default applies.
+		out.QueueTimeout = DefaultQueueTimeout
+	case pol.PlanID != "" && pol.Concurrency > 0:
+		// The concurrency cap came from the key's plan. A plan is assigned to
+		// this key deliberately, so it queues like the key's own cap rather
+		// than behaving like the global fallback. Reaching this branch means
+		// the key's own column is 0, so pol.Concurrency is the plan's value.
 		out.QueueTimeout = DefaultQueueTimeout
 	case out.Concurrency > 0:
 		// Concurrency came only from the global fallback: no queueing. This is

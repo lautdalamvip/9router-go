@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -35,6 +36,11 @@ type deepSeekFakeUpstream struct {
 	// provider is judged on can be asserted.
 	headers map[string]http.Header
 
+	// bodies captures the last request body per path, so a test can assert on
+	// what the upstream was actually asked to do — which session id it was
+	// given, which parent it was threading on, which prompt it received.
+	bodies map[string][]byte
+
 	// completionBody is the event stream the completion endpoint answers with.
 	completionBody string
 
@@ -42,26 +48,83 @@ type deepSeekFakeUpstream struct {
 	tokenStatus int
 	// tokenCode overrides the application-level code in the same envelope.
 	tokenCode int
+
+	// muteBody, when set, replaces the completion answer with an account-level
+	// enforcement document rather than an event stream.
+	muteBody string
+
+	// createdSessions counts the sessions this upstream has minted, so a test
+	// can tell a reused session from a fresh one: a turn that continues a
+	// pinned conversation must not create a second upstream session.
+	createdSessions int
+
+	// failCompletions makes the next N completion calls answer with an HTTP
+	// error instead of the event stream — the shape of a stale upstream session
+	// that a healing turn is expected to retry on a fresh one. failStatus picks
+	// the status those failures carry; zero means 500.
+	failCompletions int
+	failStatus      int
+}
+
+// countCalls reports how many requests the upstream served on path.
+func (f *deepSeekFakeUpstream) countCalls(path string) int {
+	count := 0
+	for _, call := range f.callPaths() {
+		if call == path {
+			count++
+		}
+	}
+	return count
 }
 
 // newDeepSeekFakeUpstream returns an upstream whose completion answers with the
 // given event-stream frames.
 func newDeepSeekFakeUpstream(t *testing.T, frames ...string) *deepSeekFakeUpstream {
 	t.Helper()
+	// The attestation hosts are real public endpoints, so a turn driven in a
+	// unit test has to be given a stub for them: without this the executor
+	// would fetch an attestation value from the internet mid-test.
+	stubDeepSeekAttestation(t)
+	// The turn gap and the session-delete queue run on production timers. The
+	// gap collapses to zero so consecutive turns in one test do not sit out
+	// the quiet window, and the queue starts empty so one test's retired
+	// sessions are never flushed into another test's upstream.
+	previousGap := deepSeekTurnGapFn
+	deepSeekTurnGapFn = func(time.Duration) time.Duration { return 0 }
+	t.Cleanup(func() { deepSeekTurnGapFn = previousGap })
+	t.Cleanup(deepSeekResetSessionDeletes)
 	return &deepSeekFakeUpstream{
 		challengeSalt:   "salt-for-test",
 		challengeExpire: 1778891543095,
 		headers:         map[string]http.Header{},
+		bodies:          map[string][]byte{},
 		completionBody:  strings.Join(frames, ""),
 		tokenStatus:     http.StatusOK,
 	}
 }
 
 func (f *deepSeekFakeUpstream) record(r *http.Request) {
+	body, _ := io.ReadAll(r.Body)
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, r.URL.Path)
 	f.headers[r.URL.Path] = r.Header.Clone()
+	f.bodies[r.URL.Path] = body
+}
+
+// body decodes the request the upstream received on path.
+func (f *deepSeekFakeUpstream) body(t *testing.T, path string) map[string]any {
+	t.Helper()
+	f.mu.Lock()
+	raw := append([]byte(nil), f.bodies[path]...)
+	f.mu.Unlock()
+
+	var decoded map[string]any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("decode %s request body %q: %v", path, raw, err)
+	}
+	return decoded
 }
 
 func (f *deepSeekFakeUpstream) callPaths() []string {
@@ -84,10 +147,14 @@ func (f *deepSeekFakeUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		})
 
 	case "/api/v0/chat_session/create":
+		f.mu.Lock()
+		f.createdSessions++
+		id := fmt.Sprintf("session-%d", f.createdSessions)
+		f.mu.Unlock()
 		_ = json.MarshalWrite(w, map[string]any{
 			"code": 0,
 			"data": map[string]any{"biz_data": map[string]any{
-				"chat_session": map[string]any{"id": "session-1"},
+				"chat_session": map[string]any{"id": id},
 			}},
 		})
 
@@ -112,6 +179,28 @@ func (f *deepSeekFakeUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		})
 
 	case deepSeekCompletionPath:
+		f.mu.Lock()
+		failing := f.failCompletions > 0
+		if failing {
+			f.failCompletions--
+		}
+		failStatus := f.failStatus
+		f.mu.Unlock()
+		if failing {
+			status := failStatus
+			if status == 0 {
+				status = http.StatusInternalServerError
+			}
+			w.WriteHeader(status)
+			_ = json.MarshalWrite(w, map[string]any{"code": 1, "msg": "chat session is gone"})
+			return
+		}
+		if f.muteBody != "" {
+			// The account-level enforcement: HTTP 200, a JSON document, and no
+			// event stream at all.
+			fmt.Fprint(w, f.muteBody)
+			return
+		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		fmt.Fprint(w, f.completionBody)
 
@@ -166,13 +255,18 @@ func TestForwardDeepSeekWebStreams(t *testing.T) {
 		t.Fatalf("ForwardDeepSeekWeb: %v", err)
 	}
 
+	// Stealth mode is on by default, so a plain request with no client session
+	// id creates a session and retires it when the turn ends: the session is
+	// not pinned to a conversation, so nothing will ever thread on it. The
+	// retirement is queued rather than immediate — an instant
+	// create-then-delete is a cadence no browser produces — so the delete
+	// arrives when the queue flushes, not in the turn's own call sequence.
 	calls := upstream.callPaths()
 	wantOrder := []string{
 		"/api/v0/users/current",
 		"/api/v0/chat_session/create",
 		"/api/v0/chat/create_pow_challenge",
 		deepSeekCompletionPath,
-		"/api/v0/chat_session/delete",
 	}
 	if len(calls) != len(wantOrder) {
 		t.Fatalf("expected %d upstream calls, got %v", len(wantOrder), calls)
@@ -181,6 +275,24 @@ func TestForwardDeepSeekWebStreams(t *testing.T) {
 		if calls[i] != want {
 			t.Fatalf("call %d = %q, want %q (full order: %v)", i, calls[i], want, calls)
 		}
+	}
+
+	// The completion always asks the upstream for a stream, whatever the
+	// client asked for: the site's own client has no non-streaming mode, and
+	// a `stream: false` on this endpoint is a value no browser ever wrote.
+	if got, _ := upstream.body(t, deepSeekCompletionPath)["stream"].(bool); !got {
+		t.Error("completion carried stream = false, want the browser's constant true")
+	}
+	// The Referer names the conversation's own page, which is the page the
+	// browser stands on while it streams this answer.
+	if got := upstream.headers[deepSeekCompletionPath].Get("Referer"); got != server.URL+"/a/chat/s/session-1" {
+		t.Errorf("completion Referer = %q, want the conversation's page %q", got, server.URL+"/a/chat/s/session-1")
+	}
+
+	// The queued retirement lands on the flush, in the browser stack's shape.
+	deepSeekFlushSessionDeletes(context.Background())
+	if got := upstream.countCalls("/api/v0/chat_session/delete"); got != 1 {
+		t.Errorf("session deletes = %d, want 1 after the queue flush", got)
 	}
 
 	// The proof of work must be a real answer to this challenge, not a header
@@ -207,23 +319,38 @@ func TestForwardDeepSeekWebStreams(t *testing.T) {
 
 	// The browser fingerprint is what this provider is judged on; a regression
 	// here is a 4xx from the real site, not a test failure.
+	//
+	// The set is the one a CHAT call carries. The site's own client issues
+	// the chat calls below the interceptor that adds the `x-client-*` block,
+	// so a chat call that carried the block would be a call no browser made.
 	completionHeaders := upstream.headers[deepSeekCompletionPath]
 	for header, want := range map[string]string{
-		"X-Client-Bundle-Id": "com.deepseek.chat",
-		"X-Client-Version":   "2.0.0",
-		"X-Client-Platform":  "web",
-		"Origin":             server.URL,
-		"Authorization":      "Bearer access-token-1",
+		"Origin":         server.URL,
+		"Authorization":  "Bearer access-token-1",
+		"Sec-Fetch-Mode": "cors",
+		"X-Hif-Leim":     "attestation-leim-value",
+		"X-Hif-Dliq":     "attestation-dliq-value",
+		"Content-Type":   "application/json",
+		"Priority":       "u=1, i",
 	} {
 		if got := completionHeaders.Get(header); got != want {
 			t.Errorf("completion %s = %q, want %q", header, got, want)
 		}
 	}
-	if ua := completionHeaders.Get("User-Agent"); !strings.Contains(ua, "Chrome/149") {
-		t.Errorf("completion User-Agent = %q, want the captured Chrome/149 build", ua)
+	if ua := completionHeaders.Get("User-Agent"); ua != deepSeekWebUserAgent {
+		t.Errorf("completion User-Agent = %q, want the declared build %q", ua, deepSeekWebUserAgent)
 	}
-	if got := completionHeaders.Get("Cookie"); !strings.Contains(got, "HWWAFSESID=") {
-		t.Errorf("completion Cookie = %q, want the synthetic anti-bot cookie", got)
+	// The client block belongs to the settings calls, not to the chat ones.
+	for _, header := range []string{"X-Client-Bundle-Id", "X-Client-Version", "X-Client-Platform", "X-Client-Locale"} {
+		if got := completionHeaders.Get(header); got != "" {
+			t.Errorf("completion %s = %q, want it absent — the chat calls carry no client block", header, got)
+		}
+	}
+	// The client hints belong to the telemetry call, not to the chat ones.
+	for _, header := range []string{"Sec-Ch-Ua", "Sec-Ch-Ua-Mobile", "Sec-Ch-Ua-Platform"} {
+		if got := completionHeaders.Get(header); got != "" {
+			t.Errorf("completion %s = %q, want it absent — no browser sends client hints on an API call", header, got)
+		}
 	}
 
 	body := rec.Body.String()
@@ -288,6 +415,11 @@ func TestForwardDeepSeekWebNonStream(t *testing.T) {
 	}
 	if completion.Choices[0].Message.ReasoningContent != "considering" {
 		t.Errorf("reasoning_content = %q, want %q", completion.Choices[0].Message.ReasoningContent, "considering")
+	}
+	// The upstream is asked for a stream even for a non-streaming client: the
+	// site's own client has no other mode, and the collector drains it.
+	if got, _ := upstream.body(t, deepSeekCompletionPath)["stream"].(bool); !got {
+		t.Error("a non-streaming client must not turn the upstream request into stream = false")
 	}
 }
 
@@ -395,30 +527,5 @@ func TestForwardDeepSeekWebRejectsMissingCredential(t *testing.T) {
 	}
 	if calls := upstream.callPaths(); len(calls) != 0 {
 		t.Errorf("no upstream call should be made without a credential, got %v", calls)
-	}
-}
-
-// TestForwardGeminiWebFailsClosed proves gemini-web refuses rather than
-// forwarding a request that cannot succeed.
-//
-// gemini.google.com only answers from inside its own web client, so the
-// forwarded request would return a 401 that reads as an expired cookie. Saying
-// the provider is not routable in this build is the answer the operator can act
-// on.
-func TestForwardGeminiWebFailsClosed(t *testing.T) {
-	rec := httptest.NewRecorder()
-	err := ForwardGeminiWeb(rec, &Request{
-		Ctx:    context.Background(),
-		Config: &providers.ProviderConfig{BaseURL: "https://gemini.google.com/app"},
-	})
-	if err == nil {
-		t.Fatal("gemini-web must refuse a chat request in a build with no browser")
-	}
-	status, ok := deepSeekUpstreamStatus(err)
-	if !ok || status != http.StatusNotImplemented {
-		t.Fatalf("error = %v (status %d), want 501", err, status)
-	}
-	if !strings.Contains(err.Error(), "no browser") {
-		t.Errorf("error should name the reason; got %v", err)
 	}
 }

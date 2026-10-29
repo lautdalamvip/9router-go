@@ -27,16 +27,22 @@
   import SkillsView from './components/SkillsView.svelte'
   import SettingsView from './components/SettingsView.svelte'
   import SecurityPanel from './components/security/SecurityPanel.svelte'
+  import PlansView from './components/plans/PlansView.svelte'
   import Sidebar from './components/Sidebar.svelte'
   import UpdateModal from './components/UpdateModal.svelte'
   import type { SystemVersionInfo } from './api/client'
   import Toasts from './lib/ui/Toasts.svelte'
   import TerminalView from './components/TerminalView.svelte'
   import TokenSaverView from './components/TokenSaverView.svelte'
+  import JailbreakView from './components/JailbreakView.svelte'
   import TopBar from './components/TopBar.svelte'
   import { parseMediaProvider, parseProviderId, pathToTab, providerPath, mediaProviderPath, TAB_ROUTES, type ActiveTab, type MediaProviderRoute } from './lib/router'
   import { PROVIDER_CATALOG } from './lib/providers'
   import { getIconPath } from './components/connections/types'
+  import { isNavHidden, normalizeHiddenNav, normalizeNavOrder } from './lib/nav'
+  import { setHiddenNavEntries } from './lib/navVisibility.svelte'
+  import { setDisplayCurrency } from './lib/currency.svelte'
+  import { applyAnimationLevel } from './lib/displayPrefs'
 
   let activeTab = $state<ActiveTab>(
     typeof window !== 'undefined' ? pathToTab(window.location.pathname) : 'endpoint'
@@ -46,6 +52,34 @@
   let combos = $state<Combo[]>([])
   let apiKeys = $state<APIKey[]>([])
   let settings = $state<Settings>({})
+  // True once the boot fetch has resolved, so the visibility guard can tell
+  // "this deployment stores no hide list" from "the list has not arrived yet".
+  let settingsLoaded = $state(false)
+
+  // Feature Visibility: the entries the operator hid, and the arrangement they
+  // moved them into. The sidebar and this guard read the same settings
+  // (web/src/lib/nav.ts).
+  let hiddenNav = $derived(normalizeHiddenNav(settings.navVisibility))
+  let navOrder = $derived(normalizeNavOrder(settings.navVisibility))
+
+  // Mirror the list for the components that read it outside the settings flow
+  // (the API-key editor drops its Plan field with the entry).
+  $effect(() => setHiddenNavEntries(hiddenNav))
+
+  // A hidden tab must not stay reachable by its own URL: the panel promises the
+  // entry is gone, and a bookmark or a back navigation would otherwise reopen
+  // it. Endpoint & Key is never hideable, so the redirect always terminates.
+  //
+  // The guard waits for the boot fetch: until it resolves `settings` is empty,
+  // so the fallback list would bounce a deep link to an entry the operator has
+  // since made visible.
+  $effect(() => {
+    if (!settingsLoaded) return
+    if (isNavHidden(activeTab, hiddenNav)) {
+      navigate('endpoint', true)
+    }
+  })
+
   let isLoading = $state(true)
   let isAuthChecking = $state(true)
   let isAuthenticatedState = $state(false)
@@ -121,7 +155,11 @@
       combos = combosRes
       apiKeys = keysRes
       settings = settingsRes
+      // Every cost surface reads the display currency from the store, so it is
+      // pushed in wherever the settings land.
+      setDisplayCurrency(settingsRes.displayCurrency)
     } finally {
+      settingsLoaded = true
       isLoading = false
     }
   }
@@ -149,6 +187,7 @@
   }
 
   onMount(() => {
+    applyAnimationLevel()
     const unsubscribeUnauthorized = onUnauthorized(() => {
       isAuthenticatedState = false
       requireLogin = true
@@ -250,6 +289,12 @@
     'console-log': { title: 'Console Log', description: 'Live server console output' },
     terminal: { title: 'Console Log', description: 'Live server console output' },
     settings: { title: 'Settings', description: 'Manage your preferences and configuration' },
+    security: {
+      title: 'Security',
+      description: 'Encrypt provider credentials at rest, and scan prompts for personal data and injection attempts before they leave the gateway',
+    },
+    plans: { title: 'Plans', description: 'Per-key quota plans and policy resolution' },
+    jailbreak: { title: 'Persona', description: 'Per-model system-prompt injection and Gemini safety bypass' },
   }
 
   function handleOpenNewCombo() {
@@ -296,10 +341,16 @@
     {/if}
 
     <!-- Left Sidebar -->
+    <!-- z-50 is the mobile drawer's layer, above its backdrop at z-40. On
+         desktop the wrapper returns to normal flow (lg:static), and an index
+         there made it a sibling stacking context above the content column:
+         every dialog opened inside <main> painted underneath the sidebar and
+         lost its left edge (issue #729). lg:z-auto drops the index exactly
+         where the drawer becomes the static column. -->
     <div
-      class="fixed inset-y-0 left-0 z-50 lg:static transition-transform duration-300 transform lg:transform-none {isMobileMenuOpen
+      class="fixed inset-y-0 left-0 z-50 lg:static lg:z-auto transition-transform duration-300 transform lg:transform-none {isMobileMenuOpen
         ? 'translate-x-0'
-        : '-translate-x-full lg:translate-x-0'}"
+        : '-translate-x-full lg:translate-x-0 pointer-events-none lg:pointer-events-auto'}"
     >
       <Sidebar
         bind:activeTab
@@ -312,6 +363,10 @@
         bind:showUpdateModal={isUpdateModalOpen}
         bind:updateInfo={systemUpdateInfo}
         bind:version={systemVersion}
+        hiddenNav={hiddenNav}
+        navOrder={navOrder}
+        brandName={settings.appName || ''}
+        brandLogo={settings.appLogoUrl || ''}
       />
     </div>
 
@@ -349,7 +404,7 @@
             </div>
           {:else}
             {#if activeTab === 'endpoint'}
-              <EndpointView {apiKeys} {settings} onRefresh={loadData} />
+              <EndpointView {apiKeys} {settings} onRefresh={loadData} navigate={(tab) => navigate(tab)} />
             {:else if activeTab === 'connections'}
               <ConnectionsView
                 {connections}
@@ -554,6 +609,10 @@
               <ProfileSettingsView {settings} onRefresh={loadData} />
             {:else if activeTab === 'security'}
               <SecurityPanel />
+            {:else if activeTab === 'plans'}
+              <PlansView />
+            {:else if activeTab === 'jailbreak'}
+              <JailbreakView />
             {/if}
           {/if}
         </div>

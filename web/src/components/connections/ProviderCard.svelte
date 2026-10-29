@@ -5,6 +5,7 @@
   import Toggle from '../../lib/ui/Toggle.svelte'
   import ProviderIcon from './ProviderIcon.svelte'
   import { type ProviderStats } from './types'
+  import { isProviderTogglePersistent as readProviderTogglePersistent } from '../../lib/compactNumber'
 
   interface Props {
     id: string
@@ -28,7 +29,11 @@
     onToggleAll,
   }: Props = $props()
 
+  let isProviderTogglePersistent = $state(readProviderTogglePersistent())
   let isAllDisabled = $derived(stats.allDisabled)
+  let toggleClass = $derived(
+    isProviderTogglePersistent ? 'opacity-100 transition-opacity' : 'opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity'
+  )
 </script>
 
 <div
@@ -106,7 +111,7 @@
       <div class="flex shrink-0 items-center gap-2">
         {#if stats.total > 0}
           <div
-            class="opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity"
+            class={toggleClass}
             onclick={(e) => {
               e.stopPropagation()
               onToggleAll?.(isAllDisabled)

@@ -4,24 +4,54 @@ import (
 	"bytes"
 	"context"
 	crand "crypto/rand"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	json "encoding/json/v2"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
 
 	"9router/proxy/internal/db"
+	"9router/proxy/internal/handlers/media"
 	"9router/proxy/internal/handlerutil"
 	"9router/proxy/internal/models"
 	"9router/proxy/internal/providers"
 	"9router/proxy/internal/proxy"
 	"9router/proxy/internal/proxy/executor"
 )
+
+// ClassifyUpstreamNetworkError classifies network errors during probe/models fetch.
+// Parity with decolua/9router#4843.
+func ClassifyUpstreamNetworkError(err error) (int, string, string) {
+	if err == nil {
+		return http.StatusOK, "", ""
+	}
+	var netErr net.Error
+	if (errors.As(err, &netErr) && netErr.Timeout()) || errors.Is(err, context.DeadlineExceeded) {
+		return http.StatusGatewayTimeout, "UPSTREAM_TIMEOUT", "Request timeout - provider node not responding"
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return http.StatusBadGateway, "UPSTREAM_UNREACHABLE", "DNS lookup failed - invalid domain or network issue"
+	}
+	if errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ECONNRESET) {
+		return http.StatusBadGateway, "UPSTREAM_UNREACHABLE", "Connection refused - provider node offline or unreachable"
+	}
+	var certErr *tls.CertificateVerificationError
+	if errors.As(err, &certErr) {
+		return http.StatusBadGateway, "UPSTREAM_UNREACHABLE", "SSL certificate verification failed"
+	}
+	// Fallback for general network or system error
+	return http.StatusBadGateway, "UPSTREAM_UNREACHABLE", err.Error()
+}
 
 // validateProbeTimeout mirrors upstream's AbortSignal.timeout(8000) on probes.
 const validateProbeTimeout = 8 * time.Second
@@ -392,6 +422,15 @@ func (h *DashboardHandler) validateProviderNodeConnection(
 // (GET /models, falling back to a minimal chat request).
 func validateProviderKey(ctx context.Context, provider string, cfg providers.ProviderConfig, apiKey string, psd map[string]any) validateOutcome {
 	if cfg.NoAuth {
+		// gemini-web is the one NoAuth provider whose credential is optional
+		// rather than absent: the site serves an anonymous visitor, and a pasted
+		// cookie only raises the set of models the session may be served. So it
+		// is still probed when one is supplied — "Check" has to be able to tell
+		// a working cookie from a stale one — but an empty credential is not an
+		// error and is not probed.
+		if provider == "gemini-web" && strings.TrimSpace(apiKey) != "" {
+			return validateGeminiWeb(ctx, apiKey)
+		}
 		return validateOutcome{valid: true, supported: true}
 	}
 
@@ -413,22 +452,61 @@ func validateProviderKey(ctx context.Context, provider string, cfg providers.Pro
 		return validateXiaomiTokenplan(ctx, apiKey, psd)
 	case "grok-web":
 		return validateGrokWeb(ctx, apiKey)
+	case "uc-web":
+		valid, message := media.ValidateUcWebCookie(ctx, apiKey)
+		return validateOutcome{valid: valid, supported: true, message: message}
 	case "perplexity-web":
 		return validatePerplexityWeb(ctx, apiKey)
 	case "deepseek-web":
-		return validateDeepSeekWeb(ctx, apiKey)
+		return validateDeepSeekWeb(ctx, apiKey, psd)
 	case "gemini-web":
 		return validateGeminiWeb(ctx, apiKey)
 	case "qoder", "qoder-cn":
 		return validateQoder(ctx, provider, apiKey, psd)
+	case "runcrate":
+		// Probe the billing/balance endpoint to validate the API key.
+		headers := validateAuthHeaders(cfg, apiKey)
+		headers["Accept"] = "application/json"
+		status, _, err := validateProbeDo(ctx, http.MethodGet,
+			"https://www.runcrate.ai/api/v1/billing/balance", headers, nil)
+		if err != nil {
+			return validateOutcome{supported: true, message: err.Error()}
+		}
+		if status == http.StatusUnauthorized || status == http.StatusForbidden {
+			return validateOutcome{supported: true, message: "Invalid API key"}
+		}
+		if status < 200 || status >= 300 {
+			return validateOutcome{supported: true, message: fmt.Sprintf("Runcrate API error (%d)", status)}
+		}
+		return validateOutcome{valid: true, supported: true}
 	case "v1m":
 		return validateV1M(ctx, apiKey)
+	case "commandcode":
+		// The registry's /alpha/generate consumes credits and needs a
+		// conversation id, so only whoami can validate a key against this
+		// upstream.
+		headers := validateAuthHeaders(cfg, apiKey)
+		headers["Accept"] = "application/json"
+		status, _, err := validateProbeDo(ctx, http.MethodGet,
+			strings.TrimSuffix(commandCodeAPIBase, "/")+"/alpha/whoami?limits=1", headers, nil)
+		if err != nil {
+			return validateOutcome{supported: true, message: err.Error()}
+		}
+		if status == http.StatusUnauthorized || status == http.StatusForbidden {
+			return validateOutcome{supported: true, message: "Invalid API key"}
+		}
+		if status < 200 || status >= 300 {
+			return validateOutcome{supported: true, message: fmt.Sprintf("Command Code API error (%d)", status)}
+		}
+		return validateOutcome{valid: true, supported: true}
 	case "bedrock", "bedrock-xai":
 		// A signed ListFoundationModels call. The registry's BaseURL carries a
 		// {region} placeholder, so the generic probe would dial a literal "{region}"
 		// host — this entry signs its own request against the resolved region.
 		valid, message := proxy.BedrockProbe(ctx, http.DefaultClient, apiKey, psd)
 		return validateOutcome{valid: valid, supported: true, message: message}
+	case "nous":
+		return validateNous(ctx, apiKey)
 	}
 
 	if isAnthropicProbe(cfg) {
@@ -500,6 +578,29 @@ func validateGeneric(ctx context.Context, provider string, cfg providers.Provide
 		valid:     status != http.StatusUnauthorized && status != http.StatusForbidden,
 		supported: true,
 	}
+}
+
+func validateNous(ctx context.Context, apiKey string) validateOutcome {
+	payload, _ := json.Marshal(map[string]any{
+		"model":      providers.NousValidationModel,
+		"messages":   []map[string]string{{"role": "user", "content": "ping"}},
+		"max_tokens": 1,
+		"stream":     false,
+	})
+	headers := map[string]string{
+		"Authorization": "Bearer " + apiKey,
+		"Content-Type":  "application/json",
+	}
+	status, _, err := validateProbeDo(ctx, http.MethodPost, providers.NousChatCompletionsURL, headers, payload)
+	if err != nil {
+		return validateOutcome{supported: true, message: err.Error()}
+	}
+	valid := providers.IsNousApiKeyAccepted(status)
+	out := validateOutcome{valid: valid, supported: true}
+	if !valid {
+		out.message = providers.GetNousApiKeyValidationError(status)
+	}
+	return out
 }
 
 func validateCloudflareAI(ctx context.Context, cfg providers.ProviderConfig, apiKey string, psd map[string]any) validateOutcome {
