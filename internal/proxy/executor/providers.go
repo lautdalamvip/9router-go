@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	json "encoding/json/v2"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -76,9 +77,29 @@ func ForwardCodex(w http.ResponseWriter, req *Request) error {
 	if err != nil {
 		return fmt.Errorf("transform body: %w", err)
 	}
-	// The ChatGPT Codex backend rejects a max_output_tokens it did not ask
-	// for; every chat-completions client sends one, so drop it here (#48).
-	transformedBody = stripCodexUnsupportedTokenParams(transformedBody)
+
+	// Resolve conversation-stable session_id for Codex prompt caching
+	sessionID := req.SessionID
+	if sessionID == "" {
+		if req.ConnectionID != "" {
+			sessionID = req.ConnectionID
+		} else if req.ConnData != nil {
+			if cid, ok := req.ConnData["connectionId"].(string); ok && cid != "" {
+				sessionID = cid
+			}
+		}
+	}
+	if sessionID == "" {
+		sessionID = "default"
+	}
+
+	// Inject prompt_cache_key for stable Codex prompt caching if not already set
+	transformedBody = injectCodexPromptCacheKey(transformedBody, sessionID)
+
+	responsesLite := codexResponsesLiteBody(transformedBody)
+
+	// The ChatGPT Codex backend rejects unsupported parameters and requires the allowlist
+	transformedBody = stripCodexUnsupportedTokenParams(transformedBody, responsesLite)
 	// Only now that the "(level)" suffix is gone can the catalog id be mapped
 	// to its wire id, so this has to follow the transform rather than precede it.
 	transformedBody = rewriteCodexUpstreamModel(transformedBody)
@@ -87,12 +108,31 @@ func ForwardCodex(w http.ResponseWriter, req *Request) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	resp, err := proxy.ForwardCodex(ctx, req.Client, cfg, req.APIKey, transformedBody, req.IsStream, req.ConnData, codexResponsesLiteBody(transformedBody))
+	resp, err := proxy.ForwardCodex(ctx, req.Client, cfg, req.APIKey, transformedBody, req.IsStream, req.ConnData, responsesLite, sessionID)
 	if err != nil {
 		return fmt.Errorf("ForwardCodex: %w", err)
 	}
 	defer resp.Body.Close()
 	return handleCodexStream(w, req, resp.Body)
+}
+
+func injectCodexPromptCacheKey(body []byte, sessionID string) []byte {
+	if sessionID == "" || sessionID == "default" {
+		return body
+	}
+	var envelope map[string]any
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return body
+	}
+	if pck, ok := envelope["prompt_cache_key"].(string); ok && pck != "" {
+		return body
+	}
+	envelope["prompt_cache_key"] = sessionID
+	out, err := marshalStable(envelope)
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 // applyCodexCompact routes a compaction request to the codex /compact endpoint
@@ -413,6 +453,15 @@ func toCommandcodeImageBlock(part map[string]any) map[string]any {
 // buildCommandcodeBody transforms OpenAI request payload into CommandCode schema
 // {threadId, memory, config, params} matching upstream openaiToCommandCodeRequest.
 func buildCommandcodeBody(body []byte, model string) ([]byte, error) {
+	return buildCommandcodeBodyForSession(body, model, "")
+}
+
+// buildCommandcodeBodyForSession is buildCommandcodeBody with a
+// conversation-stable threadId derived from commandcodeSessionKey (headers,
+// body session fields, conversation prefix, connection id — in that order),
+// matching upstream toCommandCodeSessionUuid. An empty key yields a random
+// UUID.
+func buildCommandcodeBodyForSession(body []byte, model, sessionID string) ([]byte, error) {
 	var m map[string]any
 	if err := json.Unmarshal(body, &m); err != nil {
 		return body, err
@@ -448,14 +497,14 @@ func buildCommandcodeBody(body []byte, model string) ([]byte, error) {
 		params["max_tokens"] = commandcodeMaxTokens(p)
 		m["params"] = params
 		if _, hasThread := m["threadId"]; !hasThread {
-			m["threadId"] = uuid.New().String()
+			m["threadId"] = commandcodeSessionUUID(sessionID)
 		}
 		if _, hasMem := m["memory"]; !hasMem {
 			m["memory"] = ""
 		}
 		if _, hasCfg := m["config"]; !hasCfg {
 			m["config"] = map[string]any{
-				"workingDir":    "/",
+				"workingDir":    commandcodeWorkingDir,
 				"date":          time.Now().UTC().Format("2006-01-02"),
 				"environment":   providers.NodePlatform(),
 				"structure":     []any{},
@@ -506,10 +555,10 @@ func buildCommandcodeBody(body []byte, model string) ([]byte, error) {
 	}
 
 	payload := map[string]any{
-		"threadId": uuid.New().String(),
+		"threadId": commandcodeSessionUUID(sessionID),
 		"memory":   "",
 		"config": map[string]any{
-			"workingDir":    "/",
+			"workingDir":    commandcodeWorkingDir,
 			"date":          time.Now().UTC().Format("2006-01-02"),
 			"environment":   providers.NodePlatform(),
 			"structure":     []any{},
@@ -522,14 +571,16 @@ func buildCommandcodeBody(body []byte, model string) ([]byte, error) {
 		"params": params,
 	}
 
-	// json.Marshal is deliberate here: this path mints a fresh threadId on
-	// every request, so the body differs call to call whatever the member
-	// order is. The caller-shaped `params` path above keeps a supplied
-	// threadId and is the one that must stay byte-stable.
+	// json.Marshal is fine here: encoding/json sorts map keys, and threadId
+	// is derived from the client session, so a repeat turn from one session
+	// serialises byte-identically for the prefix cache. The caller-shaped
+	// `params` path above keeps marshalStable for the same reason.
 	return json.Marshal(payload)
 }
 
 // ForwardCommandcode forwards to CommandCode with NDJSON→SSE translation.
+// 502/503/504 (HTTP status or in-stream error before any byte is written)
+// are retried twice with a linear backoff, as upstream's executor does.
 func ForwardCommandcode(w http.ResponseWriter, req *Request) error {
 	var oreq struct {
 		Model string `json:"model"`
@@ -538,25 +589,68 @@ func ForwardCommandcode(w http.ResponseWriter, req *Request) error {
 		log.Warn("executor", "commandcode unmarshal body", "error", err)
 	}
 
-	reqBody, err := buildCommandcodeBody(req.Body, oreq.Model)
+	body := InjectReasoningContent(req.Body, "commandcode")
+	// commandcodeSessionKey, not req.SessionID alone: the upstream prompt
+	// cache is keyed on the threadId/x-session-id pair, and a client that
+	// carries its session in the body (Claude Code's metadata.user_id) or
+	// sends no session at all must not fall through to a per-request random
+	// id — that re-cached the whole prefix on every request (upstream
+	// decolua/9router#5006 measured 0 cache reads on 4.7B prompt tokens).
+	reqBody, err := buildCommandcodeBodyForSession(body, oreq.Model,
+		commandcodeSessionKey(body, req.SessionID, req.ConnectionID))
 	if err != nil {
 		return fmt.Errorf("marshal commandcode body: %w", err)
 	}
-	// Build request with custom headers (not using proxy.ForwardCommandcode)
 	ctx := req.Ctx
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	var envelope struct {
+		ThreadID string `json:"threadId"`
+	}
+	_ = json.Unmarshal(reqBody, &envelope)
+	for attempt := 0; ; attempt++ {
+		err = forwardCommandcodeOnce(ctx, w, req, reqBody, envelope.ThreadID, oreq.Model)
+		if attempt >= commandcodeMaxRetries || !isCommandcodeRetryable(err) {
+			return err
+		}
+		timer := time.NewTimer(time.Duration(attempt+1) * time.Second)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func isCommandcodeRetryable(err error) bool {
+	var ue *proxy.UpstreamError
+	if !errors.As(err, &ue) {
+		return false
+	}
+	return ue.StatusCode == http.StatusBadGateway ||
+		ue.StatusCode == http.StatusServiceUnavailable ||
+		ue.StatusCode == http.StatusGatewayTimeout
+}
+
+func forwardCommandcodeOnce(ctx context.Context, w http.ResponseWriter, req *Request, reqBody []byte, threadID, model string) error {
 	r, err := http.NewRequestWithContext(ctx, "POST", req.Config.BaseURL, bytes.NewReader(reqBody))
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}
 	r.Header.Set("Content-Type", "application/json")
 	r.Header.Set("Authorization", "Bearer "+req.APIKey)
-	r.Header.Set("x-session-id", uuid.New().String())
-	r.Header.Set("x-command-code-version", "0.25.7")
-	r.Header.Set("x-cli-environment", "cli")
-	r.Header.Set("User-Agent", "commandcode/0.25.7 (cli)")
+	// x-session-id mirrors the body's threadId, as the official CLI does.
+	r.Header.Set("x-session-id", threadID)
+	r.Header.Set("x-project-slug", commandcodeProjectSlug)
+	// Defaults mirror the registry StaticHeaders (command-code@1.88.0);
+	// the loop below lets a configured value win.
+	r.Header.Set("User-Agent", "cli")
+	r.Header.Set("x-command-code-version", "1.88.0")
+	r.Header.Set("x-cli-environment", "production")
+	r.Header.Set("x-cli-surface", "cli")
+	r.Header.Set("x-taste-learning", "false")
 	r.Header.Set("Accept", "text/event-stream")
 	if req.Config != nil && req.Config.StaticHeaders != nil {
 		for k, v := range req.Config.StaticHeaders {
@@ -577,7 +671,10 @@ func ForwardCommandcode(w http.ResponseWriter, req *Request) error {
 		return &proxy.UpstreamError{StatusCode: resp.StatusCode, Body: errBody}
 	}
 
-	return handleCommandcodeStream(w, req, resp.Body, oreq.Model)
+	if !req.IsStream {
+		return handleCommandcodeNonStream(w, req, resp.Body, model)
+	}
+	return handleCommandcodeStream(w, req, resp.Body, model)
 }
 
 // ForwardOpencode handles requests for opencode (free tier).
@@ -620,21 +717,12 @@ func ForwardOpencode(w http.ResponseWriter, req *Request) error {
 		req.Ctx = translator.WithToolNameMap(req.Ctx, toolNameMap)
 		w = NewToolNameRestoringWriter(w, toolNameMap)
 
+		// The lane URL is what the relay forwards to, so it is built the same way
+		// for a relayed connection as for a direct one.
 		cfg := *req.Config
-		isRelay := cfg.StaticHeaders != nil && cfg.StaticHeaders["x-relay-target"] != ""
-		if isRelay {
-			// Relay mode: BaseURL is the relay host (e.g. vercel-relay.vercel.app).
-			// Target endpoint must be set in x-relay-path, NOT by appending /responses to BaseURL.
-			cfg.StaticHeaders = make(map[string]string, len(req.Config.StaticHeaders))
-			for k, v := range req.Config.StaticHeaders {
-				cfg.StaticHeaders[k] = v
-			}
-			cfg.StaticHeaders["x-relay-path"] = "/inference/openai/v1/responses"
-		} else {
-			baseURL := strings.TrimRight(cfg.BaseURL, "/")
-			baseURL = strings.TrimSuffix(baseURL, "/chat/completions")
-			cfg.BaseURL = opencodeInferenceBase(baseURL) + "/responses"
-		}
+		baseURL := strings.TrimRight(cfg.BaseURL, "/")
+		baseURL = strings.TrimSuffix(baseURL, "/chat/completions")
+		cfg.BaseURL = opencodeInferenceBase(baseURL) + "/responses"
 		baseHeaders := cfg.StaticHeaders
 		hint := opencodeSessionHint(req, true)
 		cfg.StaticHeaders = proxy.BuildOpenCodeHeaders(cfg.StaticHeaders, hint, req.IsStream)
@@ -660,7 +748,7 @@ func ForwardOpencode(w http.ResponseWriter, req *Request) error {
 		}
 
 		if req.IsStream {
-			stallReader := proxy.NewStallReaderWithContext(ctx, resp.Body, 0, "opencode-responses")
+			stallReader := proxy.NewStallReaderWithContext(ctx, resp.Body, cfg.ResolveStallTimeout(proxy.ResolveDefaultStallTimeout()), "opencode-responses")
 			defer stallReader.Close()
 			return handleCodexStream(w, req, stallReader)
 		}
@@ -711,14 +799,9 @@ func ForwardOpencode(w http.ResponseWriter, req *Request) error {
 		}
 	}
 
+	// One lane URL for both egress paths: a relay forwards to whatever this names.
 	cfg := *req.Config
-	if isRelayConfig(&cfg) {
-		cfg.StaticHeaders = copyHeaders(cfg.StaticHeaders)
-		cfg.StaticHeaders["x-relay-path"] = "/inference/openai/v1/chat/completions"
-		cfg.BaseURL = strings.TrimRight(cfg.BaseURL, "/") + "/chat/completions"
-	} else {
-		cfg.BaseURL = opencodeChatURL(cfg.BaseURL)
-	}
+	cfg.BaseURL = opencodeChatURL(cfg.BaseURL)
 	baseHeaders := cfg.StaticHeaders
 	hint := opencodeSessionHint(req, true)
 	cfg.StaticHeaders = proxy.BuildOpenCodeHeaders(cfg.StaticHeaders, hint, true)
@@ -968,15 +1051,46 @@ func ensureMessagesFor(body []byte, provider, model string) []byte {
 	// (upstream thinkingUnified captureThinking)
 	applyClaudeThinkingDisplay(reqMap)
 	applyClaudeThinkingType(reqMap, provider, model)
+	enforceClaudeThinkingSampling(reqMap)
 	delete(reqMap, "stream_options")
 	delete(reqMap, "store")
 	delete(reqMap, "reasoning_effort")
+	delete(reqMap, "n")
+
+	// MiniMax exposes a Claude-compatible endpoint but rejects Anthropic's extended
+	// output_config parameter with a generic 400 "invalid params" (upstream #820).
+	if provider == "minimax" || provider == "minimax-cn" {
+		delete(reqMap, "output_config")
+	}
 
 	updated, err := marshalStable(reqMap)
 	if err != nil {
 		return body
 	}
 	return updated
+}
+
+// enforceClaudeThinkingSampling ensures that when Claude thinking is enabled,
+// temperature is pinned to 1.0 only if a sampling parameter (temperature or top_p)
+// was present in the request. If neither was sent, temperature remains unset so newer
+// models don't reject the request with "temperature is deprecated" (OmniRoute #18639).
+func enforceClaudeThinkingSampling(reqMap map[string]any) {
+	thinking, _ := reqMap["thinking"].(map[string]any)
+	if thinking == nil {
+		return
+	}
+	tType, _ := thinking["type"].(string)
+	if tType != "enabled" && tType != "adaptive" {
+		return
+	}
+
+	_, hasTemp := reqMap["temperature"]
+	_, hasTopP := reqMap["top_p"]
+
+	if hasTemp || hasTopP {
+		reqMap["temperature"] = 1.0
+		delete(reqMap, "top_p")
+	}
 }
 
 func convertOpenAIToolsToClaude(tools []any) []any {
@@ -1205,7 +1319,7 @@ func convertOpenAIMessagesToClaude(messages []any) (systemText string, claudeMes
 			// that re-serialize the block through a strict Rust struct — Zed
 			// answers "missing field `is_error`" to a request Anthropic itself
 			// accepts. Emitting it always keeps one body valid on both.
-			isError, _ := msgMap["is_error"].(bool)
+			isError := translator.ToolResultIsError(msgMap)
 			intermediate = append(intermediate, map[string]any{
 				"role": "user",
 				"content": []any{
@@ -1585,6 +1699,8 @@ func opencodeGoInferenceBase(base string) string {
 	switch {
 	case strings.HasSuffix(base, "/zen/go/v1"):
 		return strings.TrimSuffix(base, "/zen/go/v1") + "/inference/openai/v1"
+	case strings.HasSuffix(base, "/inference/go/openai/v1"):
+		return strings.TrimSuffix(base, "/inference/go/openai/v1") + "/inference/openai/v1"
 	case strings.HasSuffix(base, "/inference/openai/v1"):
 		return base
 	case strings.HasSuffix(base, "/inference/v1"):
@@ -1621,14 +1737,9 @@ func forwardOpencodeGoFree(w http.ResponseWriter, req *Request, cleanModel strin
 		}
 	}
 
+	// One lane URL for both egress paths: a relay forwards to whatever this names.
 	cfg := *req.Config
-	if isRelayConfig(&cfg) {
-		cfg.StaticHeaders = copyHeaders(cfg.StaticHeaders)
-		cfg.StaticHeaders["x-relay-path"] = "/inference/openai/v1/chat/completions"
-		cfg.BaseURL = strings.TrimRight(cfg.BaseURL, "/") + "/chat/completions"
-	} else {
-		cfg.BaseURL = opencodeGoInferenceBase(cfg.BaseURL) + "/chat/completions"
-	}
+	cfg.BaseURL = opencodeGoInferenceBase(cfg.BaseURL) + "/chat/completions"
 	baseHeaders := cfg.StaticHeaders
 	hint := opencodeSessionHint(req, true)
 	cfg.StaticHeaders = proxy.BuildOpenCodeHeaders(cfg.StaticHeaders, hint, true)
@@ -1718,7 +1829,7 @@ func forwardOpencodeGoGemini(w http.ResponseWriter, req *Request, cleanModel, se
 	}
 
 	if req.IsStream {
-		return geminiStream(w, resp.Body, ctx)
+		return geminiStream(w, resp.Body, ctx, req)
 	}
 	return geminiNonStream(w, resp.Body)
 }
@@ -1764,16 +1875,11 @@ func ForwardOpencodeGo(w http.ResponseWriter, req *Request) error {
 			return fmt.Errorf("normalize opencode-go muse-spark body: %w", err)
 		}
 
+		// The lane URL is what a relay forwards to, so it is built without a relay
+		// branch.
 		cfg := *req.Config
-		isRelay := cfg.StaticHeaders != nil && cfg.StaticHeaders["x-relay-target"] != ""
-		if isRelay {
-			headersCopy := make(map[string]string, len(cfg.StaticHeaders))
-			for k, v := range cfg.StaticHeaders {
-				headersCopy[k] = v
-			}
-			headersCopy["x-relay-path"] = "/zen/go/v1/responses"
-			cfg.StaticHeaders = headersCopy
-		} else if !strings.HasSuffix(cfg.BaseURL, "/responses") {
+		cfg.BaseURL = strings.Replace(cfg.BaseURL, "opencode.ai/zen/go/v1", "opencode.ai/inference/go/openai/v1", 1)
+		if !strings.HasSuffix(cfg.BaseURL, "/responses") {
 			baseURL := strings.TrimRight(cfg.BaseURL, "/")
 			if strings.HasSuffix(baseURL, "/chat/completions") {
 				baseURL = strings.TrimSuffix(baseURL, "/chat/completions")
@@ -1816,7 +1922,7 @@ func ForwardOpencodeGo(w http.ResponseWriter, req *Request) error {
 		}
 
 		if req.IsStream {
-			stallReader := proxy.NewStallReaderWithContext(ctx, resp.Body, 0, "opencode-go-responses")
+			stallReader := proxy.NewStallReaderWithContext(ctx, resp.Body, cfg.ResolveStallTimeout(proxy.ResolveDefaultStallTimeout()), "opencode-go-responses")
 			defer stallReader.Close()
 			return handleCodexStream(w, req, stallReader)
 		}
@@ -1824,8 +1930,8 @@ func ForwardOpencodeGo(w http.ResponseWriter, req *Request) error {
 	}
 
 	if opencodeGoMessagesModels[reqObj.Model] || opencodeGoMessagesModels[cleanModel] {
-		// Route to /zen/go/v1/messages (Anthropic/Claude format)
-		messagesURL := "https://opencode.ai/zen/go/v1/messages"
+		// Route to /inference/go/anthropic/v1/messages (Anthropic/Claude format)
+		messagesURL := "https://opencode.ai/inference/go/anthropic/v1/messages"
 		if req.Config != nil && req.Config.BaseURL != "" && !strings.Contains(req.Config.BaseURL, "opencode.ai") {
 			base := strings.TrimRight(req.Config.BaseURL, "/")
 			if strings.HasSuffix(base, "/chat/completions") {

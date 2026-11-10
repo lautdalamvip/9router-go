@@ -14,6 +14,7 @@ export interface ProviderModel {
 }
 
 export const PROVIDER_ID_TO_ALIAS: Record<string, string> = {
+  "zcode": "zcode",
   "agnes": "agnes",
   "bai": "bai",
   "atria": "atria",
@@ -925,9 +926,7 @@ export const BUILTIN_MODELS_BY_PROVIDER: Record<string, ProviderModel[]> = {
     {
       "id": "@cf/black-forest-labs/flux-1-schnell",
       "name": "FLUX.1 Schnell",
-      "params": [
-        "size"
-      ],
+      "params": [],
       "kind": "image"
     },
     {
@@ -1127,6 +1126,14 @@ export const BUILTIN_MODELS_BY_PROVIDER: Record<string, ProviderModel[]> = {
       "id": "codex-auto-review",
       "name": "Codex Auto Review",
       "upstreamModelId": "codex-auto-review"
+    },
+    {
+      "id": "gpt-image-2.6-flare",
+      "name": "GPT Image 2.6 Flare"
+    },
+    {
+      "id": "gpt-image-2.6-sunburst",
+      "name": "GPT Image 2.6 Sunburst"
     },
     {
       "id": "gpt-image-2.5",
@@ -2278,6 +2285,16 @@ export const BUILTIN_MODELS_BY_PROVIDER: Record<string, ProviderModel[]> = {
       "kind": "tts"
     },
     {
+      "id": "gemini-3.8-flash-tts",
+      "name": "Gemini 3.8 Flash TTS",
+      "kind": "tts"
+    },
+    {
+      "id": "gemini-3.8-flash-lite-tts",
+      "name": "Gemini 3.8 Flash Lite TTS",
+      "kind": "tts"
+    },
+    {
       "id": "embedding-001",
       "name": "Embedding 001",
       "dimensions": 768,
@@ -2486,6 +2503,16 @@ export const BUILTIN_MODELS_BY_PROVIDER: Record<string, ProviderModel[]> = {
     {
       "id": "glm-4.5-air",
       "name": "GLM-4.5-Air"
+    }
+  ],
+  "zcode": [
+    {
+      "id": "glm-5.3",
+      "name": "GLM 5.3"
+    },
+    {
+      "id": "glm-5.3-flash",
+      "name": "GLM 5.3 Flash"
     }
   ],
   "glm": [
@@ -3501,12 +3528,45 @@ export const BUILTIN_MODELS_BY_PROVIDER: Record<string, ProviderModel[]> = {
       "name": "Mistral Large 3"
     },
     {
+      "id": "pixtral-large-latest",
+      "name": "Pixtral Large"
+    },
+    {
+      "id": "mistral-small-latest",
+      "name": "Mistral Small 3"
+    },
+    {
       "id": "codestral-latest",
       "name": "Codestral"
     },
     {
       "id": "mistral-medium-latest",
       "name": "Mistral Medium 3"
+    },
+    {
+      "id": "ministral-8b-latest",
+      "name": "Ministral 8B"
+    },
+    {
+      "id": "ministral-3b-latest",
+      "name": "Ministral 3B"
+    },
+    {
+      "id": "mistral-saba-latest",
+      "name": "Mistral Saba"
+    },
+    {
+      "id": "pixtral-12b-2409",
+      "name": "Pixtral 12B"
+    },
+    {
+      "id": "codestral-mamba-latest",
+      "name": "Codestral Mamba"
+    },
+    {
+      "id": "mistral-moderation-latest",
+      "name": "Mistral Moderation",
+      "kind": "moderation"
     },
     {
       "id": "mistral-embed",
@@ -3842,6 +3902,28 @@ export const BUILTIN_MODELS_BY_PROVIDER: Record<string, ProviderModel[]> = {
     {
       "id": "gpt-image-2.5",
       "name": "GPT Image 2.5",
+      "params": [
+        "n",
+        "size",
+        "quality",
+        "response_format"
+      ],
+      "kind": "image"
+    },
+    {
+      "id": "gpt-image-2.6-flare",
+      "name": "GPT Image 2.6 Flare",
+      "params": [
+        "n",
+        "size",
+        "quality",
+        "response_format"
+      ],
+      "kind": "image"
+    },
+    {
+      "id": "gpt-image-2.6-sunburst",
+      "name": "GPT Image 2.6 Sunburst",
       "params": [
         "n",
         "size",
@@ -4988,6 +5070,10 @@ export const BUILTIN_MODELS_BY_PROVIDER: Record<string, ProviderModel[]> = {
   ],
   "sensenova": [
     {
+      "id": "sensenova-6.8-flash",
+      "name": "SenseNova 6.8 Flash"
+    },
+    {
       "id": "sensenova-6.8-flash-lite",
       "name": "SenseNova 6.8 Flash Lite"
     },
@@ -5024,6 +5110,10 @@ export const BUILTIN_MODELS_BY_PROVIDER: Record<string, ProviderModel[]> = {
     {
       "id": "deepseek-flash",
       "name": "DeepSeek V4.1 Flash"
+    },
+    {
+      "id": "glm-5.3",
+      "name": "GLM-5.3"
     },
     {
       "id": "glm-5.2",

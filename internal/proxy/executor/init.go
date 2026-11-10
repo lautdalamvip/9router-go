@@ -44,11 +44,12 @@ func RegisterAll() {
 	Register("alicode", func() Executor { return ForwardOpenAI })
 	Register("alicode-intl", func() Executor { return ForwardOpenAI })
 	Register("byteplus", func() Executor { return ForwardOpenAI })
-	Register("codebuddy-cn", func() Executor { return ForwardCodebuddyCN })
+	Register("codebuddy-cn", func() Executor { return ForwardCodebuddyCNWithTelemetry })
 	Register("codebuddy-intl", func() Executor { return ForwardCodebuddyCN })
 	Register("gitlab", func() Executor { return ForwardOpenAI })
 	Register("glm-cn", func() Executor { return ForwardZai })
 	Register("glm", func() Executor { return ForwardZai })
+	Register("zcode", func() Executor { return ForwardZcode })
 	Register("nebius", func() Executor { return ForwardOpenAI })
 	Register("minimax", func() Executor { return ForwardOpenAI })
 	Register("kimi", func() Executor { return ForwardKimi })
@@ -92,6 +93,16 @@ func RegisterAll() {
 	Register("bazaarlink", func() Executor { return ForwardOpenAI })
 	Register("bluesminds", func() Executor { return ForwardOpenAI })
 	Register("devin-cli", func() Executor { return ForwardOpenAI })
+	// Vertex AI: the registry entries carried no executor, so every request
+	// POSTed an OpenAI body at aiplatform.googleapis.com, which serves neither
+	// lane. Both provider ids share one implementation — the difference is the
+	// URL shape, decided inside from the provider id.
+	Register("vertex", func() Executor { return ForwardVertex })
+	Register("vertex-partner", func() Executor { return ForwardVertex })
+	// Perplexity Web is not OpenAI-compatible in either direction: the request
+	// is a query_str envelope and the answer is Perplexity's own event stream,
+	// so the passthrough cannot serve it.
+	Register("perplexity-web", func() Executor { return ForwardPerplexityWeb })
 	Register("freebuff", func() Executor { return ForwardFreebuff })
 	Register("kilo-gateway", func() Executor { return ForwardOpenAI })
 	Register("llm7", func() Executor { return ForwardOpenAI })

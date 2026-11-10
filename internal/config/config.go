@@ -11,31 +11,27 @@ import (
 	"time"
 
 	"github.com/spf13/viper"
-
 	"9router/proxy/internal/constants"
 	"9router/proxy/internal/log"
 )
 
 // Config holds the proxy gateway configuration.
 type Config struct {
-	Host            string
-	Port            int
-	DatabasePath    string
-	JWTSecret       string
-	InitialPassword string
-	APIKeySecret    string
-	MachineIDSalt   string
-	RTKEnabled      bool
-	CavemanEnabled  bool
-	PonytailEnabled bool
-	ADHDEnabled     bool
-	// ProxyRefreshEnabled controls whether the gateway automatically fetches
-	// and refreshes residential proxies from stormsia.github.io.
+	Host                string
+	Port                int
+	DatabasePath        string
+	JWTSecret           string
+	InitialPassword     string
+	APIKeySecret        string
+	MachineIDSalt       string
+	RTKEnabled          bool
+	CavemanEnabled      bool
+	PonytailEnabled     bool
+	ADHDEnabled         bool
+	SeatAttemptBudgetMs int
 	ProxyRefreshEnabled bool
-	// ProxyRefreshInterval controls how often the proxy pool is refreshed.
 	ProxyRefreshInterval time.Duration
-	// ProxyRefreshTopN controls how many of the fastest proxies to keep.
-	ProxyRefreshTopN int
+	ProxyRefreshTopN    int
 }
 
 // NewViper creates and configures a new Viper instance reading from .env with standard defaults.
@@ -50,9 +46,7 @@ func NewViperWithFile(configFile string) *viper.Viper {
 		v.SetConfigFile(configFile)
 		v.SetConfigType("env")
 	}
-
 	v.AutomaticEnv()
-
 	v.SetDefault("PORT", 20130)
 	v.SetDefault("API_KEY_SECRET", "endpoint-proxy-api-key-secret")
 	v.SetDefault("MACHINE_ID_SALT", "endpoint-proxy-salt")
@@ -60,10 +54,10 @@ func NewViperWithFile(configFile string) *viper.Viper {
 	v.SetDefault("CAVEMAN_ENABLED", false)
 	v.SetDefault("PONYTAIL_ENABLED", false)
 	v.SetDefault("ADHD_ENABLED", false)
+	v.SetDefault("SEAT_ATTEMPT_BUDGET_MS", 0)
 	v.SetDefault("PROXY_REFRESH_ENABLED", false)
 	v.SetDefault("PROXY_REFRESH_INTERVAL_HOURS", 1)
 	v.SetDefault("PROXY_REFRESH_TOP_N", 15)
-
 	if configFile != "" {
 		if err := v.ReadInConfig(); err != nil {
 			var configFileNotFoundError viper.ConfigFileNotFoundError
@@ -72,7 +66,6 @@ func NewViperWithFile(configFile string) *viper.Viper {
 			}
 		}
 	}
-
 	return v
 }
 
@@ -164,22 +157,18 @@ func LoadConfigFromViper(v *viper.Viper) *Config {
 	if host == "" {
 		host = strings.TrimSpace(v.GetString("BIND_ADDR"))
 	}
-
 	port := v.GetInt("PORT")
 	if port <= 0 {
 		port = 20130 // Default port (unified port)
 	}
-
 	dataDir := v.GetString("DATA_DIR")
 	if dataDir == "" {
 		dataDir = ResolveDataDir()
 	}
-
 	// Ensure the base data directory exists
 	if err := os.MkdirAll(dataDir, constants.FilePermDir); err != nil {
 		log.Warn("config", "create data dir failed", "dir", dataDir, "error", err)
 	}
-
 	// Database file: DB_PATH overrides default DATA_DIR/db/data.sqlite
 	dbPath := v.GetString("DB_PATH")
 	if dbPath == "" {
@@ -195,26 +184,22 @@ func LoadConfigFromViper(v *viper.Viper) *Config {
 			dbPath = filepath.Join(dbPath, "db", "data.sqlite")
 		}
 	}
-
 	// INITIAL_PASSWORD has no hardcoded default — an empty value forces the
 	// operator to set one explicitly rather than shipping a known password.
 	initialPassword := v.GetString("INITIAL_PASSWORD")
-
 	apiKeySecret := v.GetString("API_KEY_SECRET")
 	if apiKeySecret == "" {
 		apiKeySecret = "endpoint-proxy-api-key-secret"
 	}
-
 	machineIDSalt := v.GetString("MACHINE_ID_SALT")
 	if machineIDSalt == "" {
 		machineIDSalt = "endpoint-proxy-salt"
 	}
-
 	rtkEnabled := v.GetBool("RTK_ENABLED")
 	cavemanEnabled := v.GetBool("CAVEMAN_ENABLED")
 	ponytailEnabled := v.GetBool("PONYTAIL_ENABLED")
 	adhdEnabled := v.GetBool("ADHD_ENABLED")
-
+	seatAttemptBudgetMs := v.GetInt("SEAT_ATTEMPT_BUDGET_MS")
 	proxyRefreshEnabled := v.GetBool("PROXY_REFRESH_ENABLED")
 	proxyRefreshInterval := time.Duration(v.GetInt("PROXY_REFRESH_INTERVAL_HOURS")) * time.Hour
 	if proxyRefreshInterval <= 0 {
@@ -224,22 +209,22 @@ func LoadConfigFromViper(v *viper.Viper) *Config {
 	if proxyRefreshTopN <= 0 {
 		proxyRefreshTopN = 15
 	}
-
 	return &Config{
-		Host:            host,
-		Port:            port,
-		DatabasePath:    dbPath,
-		JWTSecret:       loadJWTSecret(v, dataDir),
-		InitialPassword: initialPassword,
-		APIKeySecret:    apiKeySecret,
-		MachineIDSalt:   machineIDSalt,
-		RTKEnabled:      rtkEnabled,
-		CavemanEnabled:  cavemanEnabled,
-		PonytailEnabled: ponytailEnabled,
-		ADHDEnabled:     adhdEnabled,
-		ProxyRefreshEnabled:  proxyRefreshEnabled,
+		Host:                host,
+		Port:                port,
+		DatabasePath:        dbPath,
+		JWTSecret:           loadJWTSecret(v, dataDir),
+		InitialPassword:     initialPassword,
+		APIKeySecret:        apiKeySecret,
+		MachineIDSalt:       machineIDSalt,
+		RTKEnabled:          rtkEnabled,
+		CavemanEnabled:      cavemanEnabled,
+		PonytailEnabled:     ponytailEnabled,
+		ADHDEnabled:         adhdEnabled,
+		SeatAttemptBudgetMs: seatAttemptBudgetMs,
+		ProxyRefreshEnabled: proxyRefreshEnabled,
 		ProxyRefreshInterval: proxyRefreshInterval,
-		ProxyRefreshTopN:     proxyRefreshTopN,
+		ProxyRefreshTopN:    proxyRefreshTopN,
 	}
 }
 
@@ -254,20 +239,17 @@ func loadJWTSecret(v *viper.Viper, dataDir string) string {
 	if secret != "" {
 		return secret
 	}
-
 	secretFile := filepath.Join(dataDir, "jwt-secret")
 	data, err := os.ReadFile(secretFile)
 	if err == nil {
 		return string(data)
 	}
-
 	// Generate 32 cryptographically secure random bytes
 	bytes := make([]byte, 32)
 	if _, err := rand.Read(bytes); err != nil {
 		log.Error("config", "crypto/rand failed to generate JWT secret; refusing to fall back to a static secret", "error", err)
 		return ""
 	}
-
 	generated := hex.EncodeToString(bytes)
 	if err := os.WriteFile(secretFile, []byte(generated), constants.FilePermKey); err != nil {
 		log.Warn("config", "write JWT secret failed", "file", secretFile, "error", err)

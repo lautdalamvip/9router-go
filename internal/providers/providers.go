@@ -2,8 +2,8 @@ package providers
 
 import (
 	"net/http"
-	"os"
 	"strings"
+	"time"
 )
 
 // ProviderConfig describes how to reach an upstream provider.
@@ -66,6 +66,33 @@ type ProviderConfig struct {
 	// endpoint strictly rejects tool declarations that omit the `type` field
 	// (e.g. MiniMax). When true, DefaultClaudeToolType will inject `type: "custom"`.
 	RequireClaudeToolType bool
+
+	// RelayURL is the edge relay (vercel/cloudflare/deno/netlify) an assigned
+	// proxy pool puts in front of this provider, or "" when the request leaves
+	// directly. It is a hint for the executors, not a rewrite: BaseURL stays the
+	// real provider endpoint and the connection's client moves the dial to the
+	// relay (internal/proxy.RelayTransport). Upstream expresses the same thing as
+	// proxyOptions.vercelRelayUrl.
+	//
+	// An executor reads it only to opt OUT of something the relay cannot carry.
+	// Opencode's stealth TLS client owns the socket, so it stands aside when a
+	// relay fronts the request; everything else needs no provider-specific code,
+	// which is the point.
+	RelayURL string
+
+	// ProxyPoolID is the proxy pool this connection routed through, or "" when
+	// the request leaves directly. It is the gateway's own identity for the
+	// egress, not a request header: the breaker and the semaphore key on
+	// provider+pool so one dead pool opens its own gate instead of taking every
+	// other egress for that provider with it (internal/handlers/chat
+	// resilienceProxyKey).
+	//
+	// It is deliberately NOT written into HeaderOverrides: that map is applied
+	// to the outbound request (internal/proxy/openai.go ApplyHeaderOverrides),
+	// so an internal key there would be sent to every upstream provider.
+	ProxyPoolID string
+	// StallTimeoutMs is the optional per-provider stall timeout in milliseconds.
+	StallTimeoutMs int `json:"stallTimeoutMs,omitempty"`
 }
 
 // Bedrock protocol constants. Region is substituted per request by the executor, so the
@@ -115,7 +142,11 @@ func BedrockModelFamily(providerID, model string) (ok bool, hint string) {
 }
 
 // IsGeminiNative returns true if provider uses Gemini-native format.
-func (p *ProviderConfig) IsGeminiNative() bool { return p.Format == "gemini-native" }
+func (p *ProviderConfig) IsGeminiNative() bool {
+	// Cloud Code Assist speaks the same Gemini envelope with a different
+	// wrapper, so it routes through the same native handler.
+	return p.Format == "gemini-native" || p.Format == "gemini-cli"
+}
 
 // IsGeminiOpenAICompat returns true if provider is Gemini behind an
 // OpenAI-compatible endpoint whose tool schema validation is as strict as the
@@ -217,6 +248,7 @@ var modelsListURL = map[string]string{
 	// is absent, so the shape needs no special case here.
 	"ollama":     "https://ollama.com/api/tags",
 	"openrouter": "https://openrouter.ai/api/v1/models",
+	"hcnsec":     "https://api.hcnsec.cn/v1/models",
 }
 
 // modelsListHeaders carries the extra headers one live-catalogue endpoint
@@ -397,6 +429,19 @@ var KnownProviders = map[string]ProviderConfig{
 		AuthScheme:   "bearer",
 		SystemoneURL: "https://v1m.ir/v1/systemone",
 	},
+	// Nace Drex — decision models on the System One protocol, the same lane
+	// shape as v1m: a state plus typed questions (noul / choice / score) in,
+	// calibrated probabilities out. The lane forwards the body and the JSON
+	// reply untouched, so a score answer's `legend` array and every
+	// `confidence` reach the client as Drex returns them. drex-max also reads
+	// a top-level `images` array; the text-only drex-v2.0 answers 422 when it
+	// is non-empty, so nothing rewrites images here (upstream v0.5.112,
+	// f7f6f5e; catalog verified live against console.nace.ai/v1/models).
+	"nace": {
+		AuthHeader:   "Authorization",
+		AuthScheme:   "bearer",
+		SystemoneURL: "https://console.nace.ai/v1/systemone",
+	},
 	"anthropic": {
 		BaseURL:    "https://api.anthropic.com/v1/messages",
 		AuthHeader: "x-api-key",
@@ -438,6 +483,13 @@ var KnownProviders = map[string]ProviderConfig{
 	// SumoPod — Indonesian AI gateway (ai.sumopod.com), OpenAI-compatible
 	// chat completions with 60+ models across Claude, Gemini, GPT, DeepSeek,
 	// Qwen, GLM, Kimi, MiniMax, Seed, Grok, Hy and Mimo.
+	"hcnsec": {
+		BaseURL:        "https://api.hcnsec.cn/v1/chat/completions",
+		AuthHeader:     "Authorization",
+		AuthScheme:     "bearer",
+		ThinkingFormat: "openai",
+		TTSURL:         "https://api.hcnsec.cn/v1/audio/speech",
+	},
 	"sumopod": {
 		BaseURL:    "https://ai.sumopod.com/v1/chat/completions",
 		AuthHeader: "Authorization",
@@ -538,18 +590,12 @@ var KnownProviders = map[string]ProviderConfig{
 		BaseURL:    "https://api.githubcopilot.com/chat/completions",
 		AuthHeader: "Authorization",
 		AuthScheme: "bearer",
-		StaticHeaders: map[string]string{
-			"copilot-integration-id":              "vscode-chat",
-			"editor-version":                      "vscode/1.110.0",
-			"editor-plugin-version":               "copilot-chat/0.38.0",
-			"user-agent":                          "GitHubCopilotChat/0.38.0",
-			"openai-intent":                       "conversation-panel",
-			"x-github-api-version":                "2025-04-01",
-			"x-vscode-user-agent-library-version": "electron-fetch",
-			"X-Initiator":                         "user",
-			"Accept":                              "application/json",
-			"Content-Type":                        "application/json",
-		},
+		// CLI identity, not the VS Code extension identity: Copilot exposes a
+		// wider entitled catalogue to `copilot-developer-cli` than to
+		// `vscode-chat`, so the old headers imported fewer models than the
+		// account owns and advertised ones it is not entitled to. See
+		// GitHubCopilotChatHeaders for why the header set is exactly the CLI's.
+		StaticHeaders: GitHubCopilotChatHeaders("", ""),
 	},
 	"mistral": {
 		BaseURL:    "https://api.mistral.ai/v1/chat/completions",
@@ -604,7 +650,7 @@ var KnownProviders = map[string]ProviderConfig{
 		ImageURL:   "https://token.sensenova.cn/v1/images/generations",
 	},
 	"cloudflare-ai": {
-		BaseURL:        "https://api.cloudflare.com/client/v4/accounts/" + os.Getenv("CLOUDFLARE_ACCOUNT_ID") + "/ai/v1/chat/completions",
+		BaseURL:        "https://api.cloudflare.com/client/v4/accounts/{accountId}/ai/v1/chat/completions",
 		AuthHeader:     "Authorization",
 		AuthScheme:     "bearer",
 		ThinkingFormat: "openai",
@@ -644,7 +690,7 @@ var KnownProviders = map[string]ProviderConfig{
 		AuthScheme: "bearer",
 	},
 	"opencode-go": {
-		BaseURL:    "https://opencode.ai/zen/go/v1/chat/completions",
+		BaseURL:    "https://opencode.ai/inference/go/openai/v1/chat/completions",
 		AuthHeader: "Authorization",
 		AuthScheme: "bearer",
 	},
@@ -718,10 +764,12 @@ var KnownProviders = map[string]ProviderConfig{
 		AuthScheme:     "bearer",
 		ThinkingFormat: "openai",
 		StaticHeaders: map[string]string{
-			"User-Agent":          "CLI/2.108.1 CodeBuddy/2.108.1",
+			"User-Agent":          "CLI/2.133.1 CodeBuddy/2.133.1",
 			"X-Product":           "SaaS",
 			"X-IDE-Type":          "CLI",
 			"X-IDE-Name":          "CLI",
+			"X-IDE-Version":       "2.133.1",
+			"X-Domain":            "www.codebuddy.cn",
 			"x-requested-with":    "XMLHttpRequest",
 			"x-codebuddy-request": "1",
 		},
@@ -755,6 +803,14 @@ var KnownProviders = map[string]ProviderConfig{
 		BaseURL:    "https://api.z.ai/api/coding/paas/v4/chat/completions",
 		AuthHeader: "Authorization",
 		AuthScheme: "bearer",
+	},
+	// zcode: ZCode start-plan lane. Auth is the plan JWT stored on each
+	// connection (device-flow login), never a shared key — the same shape as
+	// kimi and muse. Format=claude: the plan endpoint speaks Anthropic Messages,
+	// so the dispatcher converts OpenAI bodies and flags the reply lane.
+	"zcode": {
+		BaseURL: "https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages",
+		Format:  FormatClaude,
 	},
 	"kimchi": {
 		BaseURL:    "https://llm.kimchi.dev/openai/v1/chat/completions",
@@ -823,9 +879,13 @@ var KnownProviders = map[string]ProviderConfig{
 		AuthHeader: "Authorization",
 		AuthScheme: "bearer",
 		StaticHeaders: map[string]string{
-			"User-Agent":             "commandcode/0.25.7 (cli)",
-			"x-command-code-version": "0.25.7",
-			"x-cli-environment":      "cli",
+			// Static identity headers of command-code@1.88.0
+			// buildCommandAuthHeaders() (upstream decolua/9router b1effa03).
+			"User-Agent":             "cli",
+			"x-command-code-version": "1.88.0",
+			"x-cli-environment":      "production",
+			"x-cli-surface":          "cli",
+			"x-taste-learning":       "false",
 		},
 	},
 	"ollama-local": {
@@ -1262,9 +1322,15 @@ var KnownProviders = map[string]ProviderConfig{
 		AuthScheme: "bearer",
 	},
 	"gemini-cli": {
-		BaseURL:    "https://daily-cloudcode-pa.googleapis.com/v1internal",
+		// Cloud Code Assist speaks the Gemini envelope: the body is
+		// {project, model, request} and the path is :generateContent on the
+		// v1internal root. Without the format marker a request fell through to
+		// ForwardOpenAI and POSTed an OpenAI body at cloudcode-pa, which that
+		// endpoint cannot answer.
+		BaseURL:    "https://cloudcode-pa.googleapis.com/v1internal",
 		AuthHeader: "Authorization",
 		AuthScheme: "bearer",
+		Format:     "gemini-cli",
 	},
 	"google-pse": {
 		BaseURL:      "https://www.googleapis.com/customsearch/v1",
@@ -1426,6 +1492,19 @@ func PreservesCacheControl(provider string) bool {
 	return false
 }
 
+// StrictReasoningRemoving reports whether a provider rejects unknown
+// assistant-message reasoning fields echoed on history (upstream
+// paramSupport dropMessageFields): groq, mistral, and cerebras answer 400
+// or 422 on reasoning_content/reasoning/reasoning_details replayed by
+// reasoning clients (e.g. Hermes).
+func StrictReasoningRemoving(provider string) bool {
+	switch provider {
+	case "groq", "mistral", "cerebras":
+		return true
+	}
+	return false
+}
+
 // IsLocalByDesign reports whether a provider's official upstream is intended
 // to run locally on loopback (e.g. ollama-local on localhost:11434).
 func IsLocalByDesign(provider string) bool {
@@ -1433,4 +1512,14 @@ func IsLocalByDesign(provider string) bool {
 		return cfg.LocalByDesign
 	}
 	return false
+}
+
+// ResolveStallTimeout returns the stall timeout for this provider config.
+// If c != nil && c.StallTimeoutMs > 0, returns time.Duration(c.StallTimeoutMs) * time.Millisecond.
+// Otherwise returns defaultTimeout.
+func (c *ProviderConfig) ResolveStallTimeout(defaultTimeout time.Duration) time.Duration {
+	if c != nil && c.StallTimeoutMs > 0 {
+		return time.Duration(c.StallTimeoutMs) * time.Millisecond
+	}
+	return defaultTimeout
 }

@@ -1,30 +1,29 @@
 <script lang="ts">
-  import { Play, Plus, Search, Server } from 'lucide-svelte'
-  import type { ProviderConnection, ProviderNode, Settings } from '../../api/client'
+  import { Download, Play, Plus, Search, Server } from 'lucide-svelte'
+  import type { ProviderConnection, ProviderNode } from '../../api/client'
   import Button from '../../lib/ui/Button.svelte'
   import { PROVIDER_CATALOG, isChatProvider } from '../../lib/providers'
   import ProviderCard from './ProviderCard.svelte'
   import { getProviderStats, matchesFilter, matchesSearch, providerAuthTypes } from './types'
-  import { providerUsesProxy } from './providerProxy'
 
   interface Props {
     connections: ProviderConnection[]
     providerNodes: ProviderNode[]
-    /** App settings; used to detect provider-level proxy strategy bindings. */
-    settings?: Settings | null
     onSelectProvider: (id: string) => void
     onToggleAll: (id: string, active: boolean) => void
     /** Opens the unified add-custom-provider dialog; the modal owns the type. */
     onAddCustom: () => void
+    /** Opens the import surface. Optional so existing callers keep working. */
+    onImport?: () => void
   }
 
   let {
     connections = [],
     providerNodes = [],
-    settings = null,
     onSelectProvider,
     onToggleAll,
     onAddCustom,
+    onImport,
   }: Props = $props()
 
   let searchQuery = $state('')
@@ -32,10 +31,6 @@
   let showAllApikey = $state(false)
 
   const APIKEY_INITIAL_VISIBLE = 20
-
-  /** True when the provider routes through a proxy (strategy pool or per-connection). */
-  const usesProxy = (providerId: string) =>
-    providerUsesProxy(providerId, connections, settings)
 
   // 1. Custom Providers
   let customNodes = $derived(
@@ -106,9 +101,16 @@
       <h2 class="text-lg sm:text-xl font-semibold leading-tight text-text-main">
         Custom Providers (OpenAI, Anthropic, Embedding)
       </h2>
-      <Button size="sm" onclick={onAddCustom} class="w-full sm:w-auto">
-        <Plus class="w-4 h-4 mr-1" /> Add Custom Provider
-      </Button>
+      <div class="flex flex-col gap-2 sm:flex-row sm:w-auto">
+        <Button size="sm" onclick={onAddCustom} class="w-full sm:w-auto">
+          <Plus class="w-4 h-4 mr-1" /> Add Custom Provider
+        </Button>
+        {#if onImport}
+          <Button size="sm" variant="secondary" onclick={onImport} class="w-full sm:w-auto">
+            <Download class="w-4 h-4 mr-1" /> Import
+          </Button>
+        {/if}
+      </div>
     </div>
 
     {#if customNodes.length === 0}
@@ -147,7 +149,6 @@
             id={p.id}
             name={p.name}
             stats={p.stats}
-            hasProxy={usesProxy(p.id)}
             onClick={() => onSelectProvider(p.id)}
             onToggleAll={(active) => onToggleAll(p.id, active)}
           />
@@ -172,7 +173,6 @@
             name={p.name}
             stats={p.stats}
             noAuth={p.noAuth}
-            hasProxy={usesProxy(p.id)}
             onClick={() => onSelectProvider(p.id)}
             onToggleAll={(active) => onToggleAll(p.id, active)}
           />
@@ -196,7 +196,6 @@
             id={p.id}
             name={p.name}
             stats={p.stats}
-            hasProxy={usesProxy(p.id)}
             onClick={() => onSelectProvider(p.id)}
             onToggleAll={(active) => onToggleAll(p.id, active)}
           />

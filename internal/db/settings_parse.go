@@ -29,7 +29,14 @@ func parseSettings(rawData string) (*SettingsData, bool) {
 	applyProviderThinking(s, raw)
 	applyCapacityAdapters(s, raw)
 	applyProviderOverrides(s, raw)
+	applySeatAttemptBudget(s, raw)
 	return s, true
+}
+
+func applySeatAttemptBudget(s *SettingsData, raw map[string]any) {
+	if sab, ok := raw["seatAttemptBudgetMs"].(float64); ok && sab >= 0 {
+		s.SeatAttemptBudgetMs = int(sab)
+	}
 }
 
 func applyRTKSettings(s *SettingsData, raw map[string]any) {
@@ -123,6 +130,15 @@ func applyHeadroomSettings(s *SettingsData, raw map[string]any) {
 	}
 	if v, ok := raw["headroomEnabled"].(bool); ok {
 		s.HeadroomEnabled = v
+	}
+	if v, ok := raw["headroomAutostart"].(bool); ok {
+		s.HeadroomAutostart = v
+	}
+	// An empty field is not written: the row keeps whatever the default put
+	// there, which is the built-in engine. Storing "" would make a later read
+	// lose the default and look like a row that never had one.
+	if v := handlerutil.GetString(raw, "headroomEngine"); v != "" {
+		s.HeadroomEngine = v
 	}
 	if v, ok := raw["headroomCodeAware"].(bool); ok {
 		s.HeadroomCodeAware = v

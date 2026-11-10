@@ -71,7 +71,7 @@ const codexResponsesLiteHeader = "x-openai-internal-codex-responses-lite"
 // responsesLite is the caller's answer rather than a decision made here: the
 // executor owns which shape a body ended up in, and the package boundary keeps
 // this one from importing that back.
-func ForwardCodex(ctx context.Context, client *http.Client, cfg *providers.ProviderConfig, apiKey string, body []byte, isStream bool, psd map[string]any, responsesLite bool) (*http.Response, error) {
+func ForwardCodex(ctx context.Context, client *http.Client, cfg *providers.ProviderConfig, apiKey string, body []byte, isStream bool, psd map[string]any, responsesLite bool, sessionID string) (*http.Response, error) {
 	headers := map[string]string{
 		"originator": "codex_cli_rs",
 	}
@@ -80,7 +80,28 @@ func ForwardCodex(ctx context.Context, client *http.Client, cfg *providers.Provi
 	} else {
 		cfg = providers.WithoutStaticHeader(cfg, codexResponsesLiteHeader)
 	}
-	if accountID, ok := psd["chatgptAccountId"].(string); ok && accountID != "" {
+
+	// Session pinning for prompt caching continuity
+	sess := sessionID
+	if sess == "" {
+		if cid, ok := psd["connectionId"].(string); ok && cid != "" {
+			sess = cid
+		} else {
+			sess = "default"
+		}
+	}
+	headers["session_id"] = sess
+
+	// Workspace / account header: prefer workspaceId, then chatgptAccountId, then accountId
+	accountID := ""
+	if ws, ok := psd["workspaceId"].(string); ok && ws != "" {
+		accountID = ws
+	} else if act, ok := psd["chatgptAccountId"].(string); ok && act != "" {
+		accountID = act
+	} else if acc, ok := psd["accountId"].(string); ok && acc != "" {
+		accountID = acc
+	}
+	if accountID != "" {
 		headers["chatgpt-account-id"] = accountID
 	}
 	setAuth(headers, cfg, apiKey)
@@ -194,9 +215,16 @@ func kiroEndpointFallbackStatus(status int) bool {
 		status == http.StatusNotFound
 }
 
+// kiroServiceRegions limits regionalization to regions that AWS service host serves.
+var kiroServiceRegions = map[string]map[string]bool{
+	"q":             {"us-east-1": true, "eu-central-1": true},
+	"runtime":       {"us-east-1": true, "eu-central-1": true},
+	"codewhisperer": {"us-east-1": true},
+}
+
 // kiroEndpoints returns the ordered gateway list: Amazon surfaces first (q.*
 // before the legacy codewhisperer host), then the Kiro IDE gateway, with the
-// AWS hosts regionalized to the account's own region.
+// AWS hosts regionalized to the account's own region if served.
 func kiroEndpoints(cfg *providers.ProviderConfig, psd map[string]any) []string {
 	region, _ := psd["region"].(string)
 	region = strings.TrimSpace(region)
@@ -204,7 +232,7 @@ func kiroEndpoints(cfg *providers.ProviderConfig, psd map[string]any) []string {
 		region = "us-east-1"
 	}
 	regionalize := func(endpoint string) string {
-		if region == "us-east-1" || !strings.Contains(endpoint, "amazonaws.com") {
+		if !strings.Contains(endpoint, "amazonaws.com") {
 			return endpoint
 		}
 		parts := strings.SplitN(endpoint, "://", 2)
@@ -216,14 +244,23 @@ func kiroEndpoints(cfg *providers.ProviderConfig, psd map[string]any) []string {
 		if len(service) != 2 {
 			return endpoint
 		}
-		localized := service[0] + "." + region + ".amazonaws.com"
+		svcName := service[0]
+		covered, ok := kiroServiceRegions[svcName]
+		if !ok || !covered[region] {
+			return endpoint
+		}
+		localized := svcName + "." + region + ".amazonaws.com"
 		if len(host) == 2 {
 			return parts[0] + "://" + localized + "/" + host[1]
 		}
 		return parts[0] + "://" + localized
 	}
 
-	q := "https://q." + region + ".amazonaws.com/generateAssistantResponse"
+	qRegion := "us-east-1"
+	if kiroServiceRegions["q"][region] {
+		qRegion = region
+	}
+	q := "https://q." + qRegion + ".amazonaws.com/generateAssistantResponse"
 	codewhisperer := regionalize("https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse")
 	kiroGateway := "https://runtime.us-east-1.kiro.dev/generateAssistantResponse"
 
@@ -315,8 +352,8 @@ func ForwardCommandcode(ctx context.Context, client *http.Client, cfg *providers
 	headers := map[string]string{
 		"Content-Type":           "application/json",
 		"Authorization":          "Bearer " + apiKey,
-		"x-command-code-version": "0.25.7",
-		"x-cli-environment":      "cli",
+		"x-command-code-version": "1.88.0",
+		"x-cli-environment":      "production",
 		"Accept":                 "text/event-stream",
 	}
 	return DoRequest(ctx, client, "POST", cfg.BaseURL, headers, body)
