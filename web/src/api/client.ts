@@ -1607,6 +1607,11 @@ export const api = {
     request<{ status: string; created: string[]; count: number }>('/api/combos/auto-family', {
       method: 'POST',
     }),
+  /** (Re)build the locked auto free-tier combo from the registry's free models. */
+  buildAutoFreeCombo: () =>
+    request<{ status: string; id: string; models: string[] }>('/api/combos/auto-free', {
+      method: 'POST',
+    }),
   /**
    * One-click optimal set: an "Auto: Optimal" master fallback chain of every
    * usable chat model (free first, then strongest, then the user's preferred

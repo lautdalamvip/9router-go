@@ -85,11 +85,11 @@
   async function handleBuildAutoFree() {
     isBuildingAutoFree = true
     try {
-      const res = await api.buildAutoFreeCombos()
-      alert(`Built ${res.count} free-tier combo(s).`)
+      const res = await api.buildAutoFreeCombo()
+      alert(`Built free-tier combo with ${res.models.length} model(s).`)
       onRefresh()
     } catch (e) {
-      alert('Failed to build free combos: ' + (e instanceof Error ? e.message : String(e)))
+      alert('Failed to build free combo: ' + (e instanceof Error ? e.message : String(e)))
     } finally {
       isBuildingAutoFree = false
     }
