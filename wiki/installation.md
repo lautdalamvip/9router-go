@@ -90,11 +90,11 @@ docker run -d --name 9router-go --restart unless-stopped \
   -p 20130:20130 -v "$HOME/.9router:/data" \
   -e PORT=20130 -e DATA_DIR=/data \
   -e INITIAL_PASSWORD=your-secure-password \
-  luqmenul/9router-go:latest
+  lautdalam/9router-go:latest
 ```
 
 Experimental builds are marked **Pre-release** and never offered to a normal
-install; Docker Hub tags them `exp` (`luqmenul/9router-go:exp`), never `latest`.
+install; Docker Hub tags them `exp` (`lautdalam/9router-go:exp`), never `latest`.
 
 ## Building from source
 
