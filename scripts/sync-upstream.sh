@@ -58,7 +58,12 @@ if git rev-parse -q --verify MERGE_HEAD >/dev/null; then
 fi
 
 note "fetching $UPSTREAM_REMOTE ..."
-git fetch --tags --quiet "$UPSTREAM_REMOTE"
+git fetch --quiet "$UPSTREAM_REMOTE"
+# `--tags` exits non-zero when a remote tag would clobber a same-named local
+# tag (the fork's experimental tags diverged from upstream's); that rejection
+# is the desired outcome, so it is tolerated rather than fatal.
+git fetch --tags --quiet "$UPSTREAM_REMOTE" \
+  || note "note: some upstream tags rejected (would clobber local tags) — expected for a fork."
 UP="$UPSTREAM_REMOTE/$UPSTREAM_BRANCH"
 
 BEHIND=$(git rev-list --count "HEAD..$UP")
