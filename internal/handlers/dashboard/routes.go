@@ -89,6 +89,13 @@ func (h *DashboardHandler) importer() *jailbreakImporter {
 // answered 200 — a delete that reports success and changes nothing.
 func getURLParam(r *http.Request, key string) string {
 	v := chi.URLParam(r, key)
+	if v == "" && key == "key" {
+		// The star form of the route (e.g. DELETE /models/custom/*) catches keys
+		// whose raw form contains a slash, and chi stores the trailing wildcard
+		// under the literal name "*". Without this fallback the handler would
+		// receive an empty key for the unescaped URL form.
+		v = chi.URLParam(r, "*")
+	}
 	if v == "" {
 		v = r.PathValue(key)
 		if v == "" {
