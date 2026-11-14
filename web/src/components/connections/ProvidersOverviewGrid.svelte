@@ -4,7 +4,7 @@
   import Button from '../../lib/ui/Button.svelte'
   import { PROVIDER_CATALOG, isChatProvider } from '../../lib/providers'
   import ProviderCard from './ProviderCard.svelte'
-  import { getProviderStats, matchesFilter, matchesSearch, providerAuthTypes } from './types'
+  import { getProviderStats, matchesFilter, matchesSearch, providerAuthTypes, providerHasProxy } from './types'
 
   interface Props {
     connections: ProviderConnection[]
@@ -36,14 +36,14 @@
   let customNodes = $derived(
     providerNodes
       .filter((n) => matchesSearch(n.name, searchQuery, n.id) && matchesFilter(getProviderStats(connections, n.id), statusFilter))
-      .map((n) => ({ ...n, stats: getProviderStats(connections, n.id) }))
+      .map((n) => ({ ...n, stats: getProviderStats(connections, n.id), hasProxy: providerHasProxy(connections, n.id) }))
   )
 
   // 2. OAuth Providers
   let oauthProviders = $derived(
     PROVIDER_CATALOG
       .filter((p) => isChatProvider(p) && !p.hidden && p.category === 'oauth' && matchesSearch(p.name, searchQuery, p.id, p.alias) && matchesFilter(getProviderStats(connections, p.id, providerAuthTypes(p, ['oauth'])), statusFilter))
-      .map((p) => ({ ...p, stats: getProviderStats(connections, p.id, providerAuthTypes(p, ['oauth'])) }))
+      .map((p) => ({ ...p, stats: getProviderStats(connections, p.id, providerAuthTypes(p, ['oauth'])), hasProxy: providerHasProxy(connections, p.id) }))
       .sort((a, b) => (b.stats.connected > 0 ? 1 : 0) - (a.stats.connected > 0 ? 1 : 0) || a.name.localeCompare(b.name))
   )
 
@@ -51,7 +51,7 @@
   let freeTierProviders = $derived(
     PROVIDER_CATALOG
       .filter((p) => isChatProvider(p) && !p.hidden && (p.category === 'free' || p.category === 'freeTier') && matchesSearch(p.name, searchQuery, p.id, p.alias) && matchesFilter(getProviderStats(connections, p.id), statusFilter, p.noAuth))
-      .map((p) => ({ ...p, stats: getProviderStats(connections, p.id) }))
+      .map((p) => ({ ...p, stats: getProviderStats(connections, p.id), hasProxy: providerHasProxy(connections, p.id) }))
       .sort((a, b) => (b.stats.connected > 0 || b.noAuth ? 1 : 0) - (a.stats.connected > 0 || a.noAuth ? 1 : 0) || a.name.localeCompare(b.name))
   )
 
@@ -59,7 +59,7 @@
   let apikeyProviders = $derived(
     PROVIDER_CATALOG
       .filter((p) => isChatProvider(p) && !p.hidden && (p.category === 'apikey' || p.category === 'webCookie') && matchesSearch(p.name, searchQuery, p.id, p.alias) && matchesFilter(getProviderStats(connections, p.id, providerAuthTypes(p, ['apikey', 'api_key'])), statusFilter))
-      .map((p) => ({ ...p, stats: getProviderStats(connections, p.id, providerAuthTypes(p, ['apikey', 'api_key'])) }))
+      .map((p) => ({ ...p, stats: getProviderStats(connections, p.id, providerAuthTypes(p, ['apikey', 'api_key'])), hasProxy: providerHasProxy(connections, p.id) }))
       .sort((a, b) => (b.stats.connected > 0 ? 1 : 0) - (a.stats.connected > 0 ? 1 : 0) || a.name.localeCompare(b.name))
   )
 
@@ -126,6 +126,7 @@
             name={node.name}
             apiType={node.apiType}
             stats={node.stats}
+            hasProxy={node.hasProxy}
             onClick={() => onSelectProvider(node.id)}
             onToggleAll={(active) => onToggleAll(node.id, active)}
           />
@@ -149,6 +150,7 @@
             id={p.id}
             name={p.name}
             stats={p.stats}
+            hasProxy={p.hasProxy}
             onClick={() => onSelectProvider(p.id)}
             onToggleAll={(active) => onToggleAll(p.id, active)}
           />
@@ -172,6 +174,7 @@
             id={p.id}
             name={p.name}
             stats={p.stats}
+            hasProxy={p.hasProxy}
             noAuth={p.noAuth}
             onClick={() => onSelectProvider(p.id)}
             onToggleAll={(active) => onToggleAll(p.id, active)}
@@ -196,6 +199,7 @@
             id={p.id}
             name={p.name}
             stats={p.stats}
+            hasProxy={p.hasProxy}
             onClick={() => onSelectProvider(p.id)}
             onToggleAll={(active) => onToggleAll(p.id, active)}
           />

@@ -135,6 +135,20 @@ export function isConnectionError(c: ProviderConnection): boolean {
 }
 
 
+/** Returns true when any connection for the given provider uses a proxy pool
+ * or a legacy per-connection proxy — the same logic as proxyBadge.ts, but
+ * aggregated at the provider-card level so the ProviderCard badge renders. */
+export function providerHasProxy(connections: ProviderConnection[], providerId: string): boolean {
+  return connections.some((c) => {
+    if (c.provider !== providerId) return false
+    const psd = (c.providerSpecificData as Record<string, unknown> | undefined) || {}
+    const poolId = typeof psd.proxyPoolId === 'string' && psd.proxyPoolId ? psd.proxyPoolId : null
+    const legacyUrl = typeof psd.connectionProxyUrl === 'string' ? psd.connectionProxyUrl : ''
+    const hasLegacyProxy = psd.connectionProxyEnabled === true && !!legacyUrl
+    return !!poolId || hasLegacyProxy
+  })
+}
+
 // providerAuthTypes returns the stored authType values a provider's card has to
 // count, given the types its section is about.
 //
