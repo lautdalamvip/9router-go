@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"9router/proxy/internal/handlerutil"
 	"9router/proxy/internal/log"
 	"9router/proxy/internal/proxy"
 )
@@ -240,6 +241,11 @@ func (c *HeadroomClient) callCompress(ctx context.Context, messages []any, model
 	httpReq.Header.Set("Content-Type", "application/json")
 	if c.apiKey != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+	// Upstream Headroom v0.44.0 uses x-headroom-session-id to isolate prefix
+	// cache trackers across parallel Claude Code subagent lineages (#2085).
+	if sessID := handlerutil.GetSessionID(ctx); sessID != "" {
+		httpReq.Header.Set("x-headroom-session-id", sessID)
 	}
 
 	resp, err := c.httpClient.Do(httpReq)
@@ -748,7 +754,7 @@ func (c *HeadroomClient) compressBuiltin(ctx context.Context, rawMessages []any,
 	if ctx.Err() != nil {
 		return nil, false
 	}
-	res, ok := c.builtin.CompressMessages(rawMessages)
+	res, ok := c.builtin.CompressMessagesWithSession(handlerutil.GetSessionID(ctx), rawMessages)
 	if !ok || res == nil {
 		return nil, false
 	}

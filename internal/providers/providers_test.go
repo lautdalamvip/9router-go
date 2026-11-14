@@ -233,7 +233,9 @@ func TestGetProviderModelKind(t *testing.T) {
 		{provider: "nvidia", model: "fastpitch", want: "tts"},
 		{provider: "nvidia", model: "tacotron2", want: "tts"},
 		{provider: "nvidia", model: "nvidia/nv-embedqa-e5-v5", want: "embedding"},
+		{provider: "nvidia", model: "nv-embedqa-e5-v5", want: "embedding"},
 		{provider: "nvidia", model: "nvidia/parakeet-ctc-1.1b-asr", want: "stt"},
+		{provider: "nvidia", model: "parakeet-ctc-1.1b-asr", want: "stt"},
 		{provider: "nvidia", model: "minimaxai/minimax-m3", want: ""},
 		{provider: "antigravity", model: "gemini-3.1-flash-image", want: "image"},
 		{provider: "antigravity", model: "gemini-3.8-flash-high", want: ""},
@@ -436,4 +438,34 @@ func TestNewProvidersRegistry_v062(t *testing.T) {
 			t.Errorf("GetProviderModelKind(gemini, %q) = %q, want tts", model, got)
 		}
 	}
+}
+
+func TestKnownProviders_Kenari(t *testing.T) {
+	cfg, ok := KnownProviders["kenari"]
+	if !ok {
+		t.Fatal("expected KnownProviders to contain kenari")
+	}
+	if cfg.BaseURL != "https://kenari.id/v1/chat/completions" {
+		t.Errorf("kenari expected BaseURL https://kenari.id/v1/chat/completions, got %s", cfg.BaseURL)
+	}
+	if cfg.AuthScheme != "bearer" || cfg.AuthHeader != "Authorization" {
+		t.Errorf("kenari expected bearer/Authorization, got %s/%s", cfg.AuthScheme, cfg.AuthHeader)
+	}
+	if got := ResolveAlias("ki"); got != "kenari" {
+		t.Errorf("ResolveAlias(ki) = %q, want kenari", got)
+	}
+	if got := RegistryAliases["kenari"]; got != "ki" {
+		t.Errorf("RegistryAliases[kenari] = %q, want ki", got)
+	}
+	models := GetProviderModels("kenari")
+	if len(models) == 0 {
+		t.Error("GetProviderModels(kenari) returned empty list")
+	}
+	for _, m := range models {
+		if m == "deepseek-v4" {
+			goto found
+		}
+	}
+	t.Error("GetProviderModels(kenari) missing deepseek-v4")
+found:
 }

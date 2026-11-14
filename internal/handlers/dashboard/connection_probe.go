@@ -13,6 +13,7 @@ import (
 
 	"9router/proxy/internal/handlers/chat"
 	"9router/proxy/internal/handlerutil"
+	"9router/proxy/internal/log"
 	"9router/proxy/internal/models"
 	"9router/proxy/internal/providers"
 	"9router/proxy/internal/proxy"
@@ -114,6 +115,11 @@ type probeOutcome struct {
 var connectionProbeDo = func(ctx context.Context, client *http.Client, method, rawURL string, headers map[string]string, body []byte) (int, []byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, connectionProbeTimeout)
 	defer cancel()
+
+	// Same identity rule as validateProbeDo: an unset User-Agent would go out
+	// as the Go default and be refused by an edge WAF (Nous Research's
+	// Cloudflare answers the probe's own /v1/chat/completions with 403).
+	headers = handlerutil.WithDefaultUserAgent(headers)
 
 	var reader io.Reader
 	if len(body) > 0 {
@@ -417,12 +423,10 @@ func (h *DashboardHandler) probeHTTPClient(data connectionProbeData, raw map[str
 		return newProbeRelayClient(proxyURLStr, probeUpstreamURL(data, raw)), ""
 	}
 
-	parsed, err := url.Parse(proxyURLStr)
-	if err != nil {
+	if _, err := url.Parse(proxyURLStr); err != nil {
 		return nil, ""
 	}
-	tr := proxy.NewSafeTransport()
-	tr.Proxy = http.ProxyURL(parsed)
+	tr := proxy.NewSafeTransportForProxy(proxyURLStr)
 	return &http.Client{
 		Transport: tr,
 		Timeout:   connectionProbeTimeout,
@@ -450,15 +454,13 @@ func probeUpstreamURL(data connectionProbeData, raw map[string]any) string {
 // probeProxyURL pre-checks a proxy before probing through it (upstream runs
 // testProxyUrl and marks the connection broken when the proxy itself is down).
 func probeProxyURL(ctx context.Context, proxyURLStr string) error {
-	parsed, err := url.Parse(proxyURLStr)
-	if err != nil {
+	if _, err := url.Parse(proxyURLStr); err != nil {
 		return fmt.Errorf("invalid proxy URL format")
 	}
 	ctx, cancel := context.WithTimeout(ctx, connectionProxyProbeTimeout)
 	defer cancel()
 
-	tr := proxy.NewSafeTransport()
-	tr.Proxy = http.ProxyURL(parsed)
+	tr := proxy.NewSafeTransportForProxy(proxyURLStr)
 	client := &http.Client{
 		Transport: tr,
 		Timeout:   connectionProxyProbeTimeout,
@@ -785,7 +787,7 @@ func (h *DashboardHandler) probeFreebuff(ctx context.Context, conn *models.Provi
 		return probeOutcome{message: fmt.Sprintf("create probe request failed: %v", err)}
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("User-Agent", "codebuff-cli/0.0.138")
+	req.Header.Set("User-Agent", "Freebuff-CLI/0.2.36")
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := executor.DoFreebuffHTTP(ctx, client, req)
@@ -1004,6 +1006,14 @@ func (h *DashboardHandler) persistProbeResult(conn *models.ProviderConnection, r
 		} else {
 			raw["lastError"] = nil
 			raw["lastErrorAt"] = nil
+		}
+		// A successful test connection proves the account is usable again, so
+		// drop the account-ban failure streak: the next ban starts from the
+		// base cooldown rather than climbing the ladder.
+		if conn != nil {
+			if clearErr := h.Repo.ClearConnectionAccountBanLock(conn.ID); clearErr != nil {
+				log.Warn("dashboard", "account ban clear failed", "conn", conn.ID, "error", clearErr)
+			}
 		}
 		if conn != nil && conn.Provider == "codex" {
 			chat.ClearCodexQuotaBlock(conn.ID)

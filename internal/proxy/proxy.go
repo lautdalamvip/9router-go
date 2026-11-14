@@ -69,7 +69,10 @@ func (e *UpstreamError) Error() string {
 var ErrStrictProxyRequired = errors.New("proxy required but failed (strictProxy=true)")
 
 var directProxyClient = &http.Client{
-	Transport: NewSafeTransport(),
+	// Truly direct: this client exists to replay a failed proxied attempt from
+	// the host's own address, so it must never route through the ambient proxy
+	// NewSafeTransport would install.
+	Transport: NewDirectSafeTransport(),
 }
 
 // insecureClientCache memoises one InsecureSkipVerify client per proxy URL,
@@ -168,6 +171,12 @@ func newJSONRequest(ctx context.Context, method, url string, headers map[string]
 	req.Header.Set("Content-Type", "application/json")
 	for k, v := range headers {
 		req.Header.Set(k, v)
+	}
+	// A streaming lane asks for an event stream. Pin identity so an edge or
+	// provider cannot answer with a buffered gzip stream that arrives as one
+	// burst instead of token by token. An explicit encoding always wins.
+	if req.Header.Get("Accept-Encoding") == "" && strings.Contains(strings.ToLower(req.Header.Get("Accept")), "text/event-stream") {
+		req.Header.Set("Accept-Encoding", "identity")
 	}
 	return req, nil
 }
@@ -360,6 +369,7 @@ func doRequestOnce(ctx context.Context, client *http.Client, method, url string,
 	if err != nil {
 		return nil, fmt.Errorf("upstream request: %w", err)
 	}
+	UnwrapIdentityGzip(req, resp)
 	if resp.StatusCode != http.StatusOK {
 		errBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 1*1024*1024))
 		resp.Body.Close()

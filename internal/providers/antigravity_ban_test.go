@@ -184,3 +184,4 @@ func TestRedactAppealURLs(t *testing.T) {
 		}
 	}
 }
+

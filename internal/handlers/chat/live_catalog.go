@@ -17,7 +17,9 @@ import (
 	"github.com/google/uuid"
 	"golang.org/x/sync/singleflight"
 
+	"9router/proxy/internal/constants"
 	"9router/proxy/internal/handlers/shared"
+	"9router/proxy/internal/handlerutil"
 	"9router/proxy/internal/log"
 	"9router/proxy/internal/models"
 	"9router/proxy/internal/providers"
@@ -265,6 +267,23 @@ func liveCatalogStoreNegative(key string) {
 	liveCatalogStore.mu.Lock()
 	defer liveCatalogStore.mu.Unlock()
 	liveCatalogStore.entries[key] = liveCatalogEntry{expiresAt: time.Now().Add(liveCatalogNegTTL)}
+}
+
+// InvalidateLiveCatalog purges cached live catalog entries for a provider.
+// If providerID is empty, it purges all cached entries.
+func InvalidateLiveCatalog(providerID string) {
+	liveCatalogStore.mu.Lock()
+	defer liveCatalogStore.mu.Unlock()
+	if providerID == "" {
+		liveCatalogStore.entries = make(map[string]liveCatalogEntry)
+		return
+	}
+	prefix := providerID + "|"
+	for k := range liveCatalogStore.entries {
+		if k == providerID || strings.HasPrefix(k, prefix) {
+			delete(liveCatalogStore.entries, k)
+		}
+	}
 }
 
 // ---- Kiro (AWS CodeWhisperer ListAvailableModels) ----
@@ -518,7 +537,7 @@ func (h *ChatHandler) fetchCompatibleNodeModels(ctx context.Context, conn *model
 	if err != nil {
 		return nil
 	}
-	for key, value := range headers {
+	for key, value := range handlerutil.WithDefaultUserAgent(headers) {
 		req.Header.Set(key, value)
 	}
 	resp, err := h.Client.Do(req)
@@ -711,6 +730,7 @@ func (h *ChatHandler) fetchAnthropicLiveCatalog(ctx context.Context, conn *model
 	req.Header.Set("x-api-key", apiKey)
 	req.Header.Set("anthropic-version", "2023-06-01")
 	req.Header.Set("Accept", "application/json")
+	req.Header.Set(constants.HeaderUserAgent, constants.DefaultClientUserAgent)
 
 	resp, err := h.Client.Do(req)
 	if err != nil {

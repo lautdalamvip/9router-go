@@ -181,3 +181,4 @@ func RedactAppealURLs(text string) string {
 		return "[verification-url]"
 	})
 }
+

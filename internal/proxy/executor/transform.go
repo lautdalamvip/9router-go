@@ -229,6 +229,13 @@ func buildResponsesBody(body []byte) ([]byte, string, error) {
 							pendingCallIDs = append(pendingCallIDs, cid)
 						case "function_call_output", "custom_tool_call_output":
 							cid, _ := itemMap["call_id"].(string)
+							// Codex also accepts function results addressed by name,
+							// without a preceding call. An invented id makes it
+							// require a matching call that does not exist.
+							name, _ := itemMap["name"].(string)
+							if itemType == "function_call_output" && cid == "" && strings.TrimSpace(name) != "" {
+								continue
+							}
 							if cid != "" {
 								for idx, p := range pendingCallIDs {
 									if p == cid {
@@ -264,9 +271,6 @@ func buildResponsesBody(body []byte) ([]byte, string, error) {
 				}
 			}
 
-			translateCodexClaudeWebSearch(m)
-			translateCodexClaudeWebSearchChoice(m)
-			applyCodexModelShape(m, cleanModel)
 			out, err := marshalStable(m)
 			return out, cleanModel, err
 		}
@@ -285,6 +289,7 @@ func buildResponsesBody(body []byte) ([]byte, string, error) {
 		Reasoning           any            `json:"reasoning,omitempty"`
 		Tools               jsontext.Value `json:"tools,omitempty"`
 		ToolChoice          jsontext.Value `json:"tool_choice,omitempty"`
+		ParallelToolCalls   *bool          `json:"parallel_tool_calls,omitempty"`
 		ResponseFormat      jsontext.Value `json:"response_format,omitempty"`
 		// ServiceTier is carried through unchanged. Upstream does the same in
 		// open-sse/translator/request/openai-responses.js, and the Chat
@@ -576,9 +581,9 @@ func buildResponsesBody(body []byte) ([]byte, string, error) {
 		}
 	}
 
-	translateCodexClaudeWebSearch(respReq)
-	translateCodexClaudeWebSearchChoice(respReq)
-	applyCodexModelShape(respReq, cleanModel)
+	if oreq.ParallelToolCalls != nil {
+		respReq["parallel_tool_calls"] = *oreq.ParallelToolCalls
+	}
 	reqBody, err := marshalStable(respReq)
 	return reqBody, cleanModel, err
 }

@@ -13,6 +13,7 @@
     type Settings
   } from '../../api/client'
   import { PROVIDER_CATALOG, PROVIDER_CATALOG_MAP, type ProviderCatalogItem } from '../../lib/providers'
+  import ClaudeCacheTtl from '../quota/ClaudeCacheTtl.svelte'
   import {
     clearCallback,
     CODEX_REDIRECT_URI,
@@ -91,10 +92,13 @@
   import Toggle from '../../lib/ui/Toggle.svelte'
   import { PauseCircle } from 'lucide-svelte'
   import ProviderHeaderOverridesModal from './ProviderHeaderOverridesModal.svelte'
+  import FreePiConnectModal from './FreePiConnectModal.svelte'
+  import FreePiAdBanner from './FreePiAdBanner.svelte'
   import EditCompatibleNodeModal from './EditCompatibleNodeModal.svelte'
   import ExportKeysModal from './ExportKeysModal.svelte'
   import ShareProviderModal from './ShareProviderModal.svelte'
   import FreebuffSessionBanner from './FreebuffSessionBanner.svelte'
+  import FreebuffAdBanner from './FreebuffAdBanner.svelte'
   import ProviderIcon from './ProviderIcon.svelte'
 
   interface Props {
@@ -792,6 +796,13 @@
     return out
   })
   let showHeaderOverrides = $state(false)
+  let showFreePiConnect = $state(false)
+  let isFreePi = $derived(providerId === 'free-pi' || storageAlias === 'fp' || storageAlias === 'free-pi')
+  let freePiConn = $derived(
+    providerConnections.find((c) => c.isActive === 1) ?? providerConnections[0] ?? null
+  )
+  let freePiResetBusy = $state(false)
+  let freePiResetResult = $state<string>('')
   // Freebuff specific state & session tracking
   let isFreebuff = $derived(
     providerId === 'freebuff' || storageAlias === 'fb' || storageAlias === 'freebuff'
@@ -1588,6 +1599,8 @@
       openAuthCodeOAuth()
     } else if (isCustomOAuth) {
       openCustomOAuth()
+    } else if (providerId === 'free-pi') {
+      showFreePiConnect = true
     } else if (providerId === 'kiro') {
       openKiroOAuth()
     } else if (isDeviceOAuth) {
@@ -1973,6 +1986,22 @@
 
 
   let isPollingDevice = $state(false)
+
+  async function clearFreePiSession() {
+    if (!freePiConn || freePiResetBusy) return
+    freePiResetBusy = true
+    freePiResetResult = ''
+    try {
+      const res = await api.freePiResetSession(freePiConn.id)
+      freePiResetResult = res.released
+        ? 'Cleared your other sessions — you can start a new one now.'
+        : 'No other session was running.'
+    } catch (err) {
+      freePiResetResult = err instanceof Error ? err.message : String(err)
+    } finally {
+      freePiResetBusy = false
+    }
+  }
 
   async function openDeviceOAuth() {
     oauthError = null
@@ -2994,7 +3023,7 @@
   let canListLiveModels = $derived(
     providerId.startsWith('openai-compatible-') ||
       isCompatibleNode ||
-      ['antigravity', 'gemini-cli', 'cline', 'clinepass', 'qoder', 'qoder-cn', 'zed'].includes(providerId) ||
+      ['antigravity', 'gemini-cli', 'cline', 'clinepass', 'qoder', 'qoder-cn', 'zed', 'claude', 'anthropic'].includes(providerId) ||
       ModelsListURLs.has(providerId)
   )
 
@@ -3443,6 +3472,11 @@
       {/if}
     </div>
   </div>
+
+  <!-- Claude prompt-cache window: a billing knob that belongs on the provider page. -->
+  {#if providerId === 'claude'}
+    <ClaudeCacheTtl />
+  {/if}
 
   <!-- 1. Risk Notice (for OAuth / subscription providers) -->
   {#if hasRiskNotice}
@@ -3953,9 +3987,22 @@
 
                   <!-- Title & badges -->
                   <div class="flex-1 min-w-0">
-                    <p class="text-sm font-medium truncate">
-                      {formatEmailLabel(conn.name || conn.email || (conn.authType === 'oauth' ? 'OAuth Account' : 'API Key Slot'), $emailPrivacy)}
-                    </p>
+                    <div class="flex items-center gap-2 flex-wrap">
+                      <p class="text-sm font-medium truncate">
+                        {formatEmailLabel(conn.name || conn.email || (conn.authType === 'oauth' ? 'OAuth Account' : 'API Key Slot'), $emailPrivacy)}
+                      </p>
+                      {#if providerId === 'mistral'}
+                        {#if specificData?.usageLane === 'vibe' || (conn.name && conn.name.toLowerCase().includes('vibe'))}
+                          <span class="inline-flex items-center gap-1 rounded font-semibold bg-purple-500/10 text-purple-600 dark:text-purple-400 border border-purple-500/20 px-1.5 py-0.5 text-[10px]">
+                            VIBE CODE
+                          </span>
+                        {:else if specificData?.usageLane === 'api' || (conn.name && conn.name.toLowerCase().includes('api'))}
+                          <span class="inline-flex items-center gap-1 rounded font-semibold bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20 px-1.5 py-0.5 text-[10px]">
+                            API PAYG
+                          </span>
+                        {/if}
+                      {/if}
+                    </div>
                     <!-- Secondary label: upstream ConnectionRow shows the email
                          under a name, or the displayName when the stored name is
                          the email (which is what the Qoder device flow writes). -->
@@ -4699,8 +4746,27 @@
         </button>
       </div>
     {/if}
+    {#if isFreePi && freePiConn}
+      <div class="mb-4">
+        <FreePiAdBanner connectionId={freePiConn.id} />
+        <div class="flex flex-wrap items-center gap-2 rounded-[10px] border border-border-subtle bg-surface-2 px-3 py-2">
+          <span class="material-symbols-outlined text-[16px] text-text-muted" aria-hidden="true">layers_clear</span>
+          <span class="text-[11px] text-text-muted">Clear this account's other sessions if a stale one blocks a request.</span>
+          <button type="button" onclick={clearFreePiSession} disabled={freePiResetBusy}
+            class="ml-auto shrink-0 rounded-lg border border-border px-2.5 py-1 text-[11px] font-medium text-text-main hover:bg-surface-3 disabled:cursor-not-allowed disabled:opacity-50">
+            {freePiResetBusy ? 'Clearing…' : 'Clear session'}
+          </button>
+        </div>
+        {#if freePiResetResult}
+          <p class="mt-1 text-[11px] text-text-muted">{freePiResetResult}</p>
+        {/if}
+      </div>
+    {/if}
     {#if isFreebuff}
       <div class="mb-4">
+        {#if targetFreebuffConn}
+          <FreebuffAdBanner connectionId={targetFreebuffConn.id} />
+        {/if}
         <FreebuffSessionBanner
           session={freebuffSession}
           isLoading={isLoadingSession}
@@ -4910,7 +4976,7 @@
         Add Model
       </button>
 
-      {#if (providerId === 'cline' || providerId === 'clinepass' || providerId === 'qoder' || providerId === 'qoder-cn' || providerId === 'commandcode' || providerId === 'vercel-ai-gateway' || providerId === 'chutes' || providerId === 'nvidia' || providerId === 'ollama' || providerId === 'openrouter') && providerConnections.some((c) => c.isActive !== 0)}
+      {#if (providerId === 'cline' || providerId === 'clinepass' || providerId === 'qoder' || providerId === 'qoder-cn' || providerId === 'commandcode' || providerId === 'commandcode-goat' || providerId === 'vercel-ai-gateway' || providerId === 'chutes' || providerId === 'nvidia' || providerId === 'ollama' || providerId === 'openrouter') && providerConnections.some((c) => c.isActive !== 0)}
         <button
           type="button"
           onclick={handleImportLiveCatalogModels}
@@ -5555,6 +5621,12 @@
   isOpen={showHeaderOverrides}
   providerId={providerId}
   onClose={() => (showHeaderOverrides = false)}
+/>
+
+<FreePiConnectModal
+  isOpen={showFreePiConnect}
+  onClose={() => (showFreePiConnect = false)}
+  onConnected={onRefresh}
 />
 
 <!-- 5b. Edit Compatible Node Modal (upstream EditCompatibleNodeModal parity) -->

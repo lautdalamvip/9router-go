@@ -48,8 +48,8 @@ func levelFor(level string, supported []string) string {
 		return NormalizeOpenAILevel(level, supported)
 	}
 	if level == "auto" {
-		// "auto" asks the upstream to decide; it is not a level to clamp.
-		return level
+		// Preserved verbatim: the step writer must ship "auto" unchanged.
+		return "auto"
 	}
 	if !KnownEffort(level) {
 		level = "medium"
@@ -88,7 +88,15 @@ func levelFor(level string, supported []string) string {
 
 func withDisplay(thinking map[string]any, display string) map[string]any {
 	if display != "" {
-		thinking["display"] = display
+		norm := strings.ToLower(strings.TrimSpace(display))
+		switch norm {
+		case "summarized", "omitted":
+			thinking["display"] = norm
+		case "none", "off", "hidden", "false":
+			thinking["display"] = "omitted"
+		default:
+			thinking["display"] = "summarized"
+		}
 	}
 	return thinking
 }
@@ -100,4 +108,14 @@ func containsLevel(levels []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// openAILevelFor resolves a level for the OpenAI and OpenAI Responses wires,
+// which reject the literal "auto". "auto" resolves to "high"; every other
+// level is handled by levelFor.
+func openAILevelFor(level string, supported []string) string {
+	if level == "auto" {
+		return "high"
+	}
+	return levelFor(level, supported)
 }

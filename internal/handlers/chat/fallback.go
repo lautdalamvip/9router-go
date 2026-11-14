@@ -338,6 +338,16 @@ func (h *ChatHandler) handleAccountFallback(
 					log.Warn("fallback", "record connection error failed", "conn", connObj.ID, "error", recErr)
 				}
 			} else {
+				// Account-level bans (permanent/severe account failures) use the
+				// escalating lockout ladder keyed on the connection's consecutive
+				// failure streak instead of a flat 24h cooldown.
+				if providers.LooksLikeAccountDeactivated(errorText) {
+					if until, _, lockErr := h.Repo.RecordConnectionAccountBanFailure(connObj.ID); lockErr != nil {
+						log.Warn("fallback", "account ban lock failed", "conn", connObj.ID, "error", lockErr)
+					} else {
+						cooldownSec = int(until.Sub(time.Now().UTC()).Seconds())
+					}
+				}
 				until := time.Now().UTC().Add(time.Duration(cooldownSec) * time.Second)
 				if lockErr := h.Repo.LockConnectionRateLimit(connObj.ID, until, classification.NewBackoffLevel, ue.StatusCode, errorText); lockErr != nil {
 					log.Warn("fallback", "rate limit lock failed", "conn", connObj.ID, "error", lockErr)
@@ -462,6 +472,14 @@ func opencodeClosureError(provider, model string, err error) error {
 		return err
 	}
 	detail := classifyOpencodeFreeTierRefusal(provider, ue.Body)
+	// The gate announces a spent allowance's real reset in Retry-After. The
+	// classifier can only guess, so a carrier beats the guess: overwriting it
+	// with the hardcoded minute made the caller re-probe a spent egress long
+	// before the window it was told to wait for. The 2h maxResetCooldown cap
+	// still applies — this changes the source of the value, not the ceiling.
+	if real, ok := upstreamRetryAfterSec(ue); ok {
+		detail.RetryAfter = real
+	}
 	body, _ := json.Marshal(map[string]any{
 		"error": map[string]any{
 			"message": detail.Message,
@@ -470,7 +488,8 @@ func opencodeClosureError(provider, model string, err error) error {
 		},
 	})
 	log.Warn("fallback", "opencode free tier refused after retries; reporting classified failure",
-		"provider", provider, "model", model, "type", detail.ErrorType, "status", detail.StatusCode)
+		"provider", provider, "model", model, "type", detail.ErrorType, "status", detail.StatusCode,
+		"retry_after_s", detail.RetryAfter)
 	header := http.Header{
 		"Content-Type": []string{"application/json"},
 	}
@@ -482,6 +501,19 @@ func opencodeClosureError(provider, model string, err error) error {
 		Body:       body,
 		Header:     header,
 	}
+}
+
+// upstreamRetryAfterSec reads the wait the upstream named, clamped like every
+// other announced cooldown. It reads the Retry-After header plus the body
+// carriers retryAfterWait already knows, so a gate that announces the window in
+// prose is honoured too. A missing or unparseable carrier reports false and the
+// caller keeps the classifier's own estimate.
+func upstreamRetryAfterSec(ue *upstreamError) (int, bool) {
+	wait, ok := retryAfterWait(ue)
+	if !ok || wait <= 0 {
+		return 0, false
+	}
+	return ceilSeconds(min(wait, maxCooldownFor("opencode"))), true
 }
 
 // tryForwardWithConnection attempts a single upstream request using the given connection data.
@@ -726,7 +758,12 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 					pipedBody = out
 				}
 			}
+			pipedBody = translator.AnchorClaudeCacheWithTTL(pipedBody, h.claudeCacheTTL())
 		}
+	}
+
+	if isAnthropic || upstreamClaude {
+		pipedBody = executor.SanitizeClaudeThinkingBody(pipedBody)
 	}
 
 	// A body that asked for thinking summaries must not also carry the
@@ -871,6 +908,7 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 			filtered, filterErr := translator.FilterToOpenAIFormatJSON(pipedBody, translator.FilterOptions{
 				PreserveCacheControl:    providers.PreservesCacheControl(provider),
 				StrictReasoningRemoving: providers.StrictReasoningRemoving(provider),
+				FlattenContent:          provider == "cloudflare-ai",
 			})
 			if filterErr != nil {
 				// The request lost every message. The upstream answers an
@@ -1231,6 +1269,12 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 		if clearErr := h.Repo.ClearConnectionRateLimit(connectionID); clearErr != nil {
 			log.Warn("fallback", "rate limit clear failed", "conn", connectionID, "error", clearErr)
 		}
+		// A served request proves the account is usable again, so drop the
+		// account-ban failure streak: the next ban starts from the base
+		// cooldown rather than climbing the ladder.
+		if clearErr := h.Repo.ClearConnectionAccountBanLock(connectionID); clearErr != nil {
+			log.Warn("fallback", "account ban clear failed", "conn", connectionID, "error", clearErr)
+		}
 		// A served request proves the account is usable again, so drop any
 		// cached quota block rather than leaving it to expire on its own.
 		if provider == "codex" {
@@ -1421,6 +1465,16 @@ func recordPersonaInjection(origTokens, savedTokens *int, beforeLen, afterLen in
 	if *savedTokens < 0 {
 		*savedTokens = 0
 	}
+}
+
+// claudeCacheTTL is the operator's head-anchor prompt-cache window. It reads
+// through TokenSaver because that config is already the per-request settings
+// snapshot the chat handler refreshes after every dashboard save.
+func (h *ChatHandler) claudeCacheTTL() string {
+	if h.TokenSaver == nil {
+		return translator.ClaudeCacheTTL5m
+	}
+	return h.TokenSaver.ClaudeCacheTTL()
 }
 
 func (h *ChatHandler) applyTokenSavers(ctx context.Context, body []byte, claudeNative bool) ([]byte, int, int, int) {

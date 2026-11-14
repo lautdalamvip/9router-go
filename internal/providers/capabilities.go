@@ -328,6 +328,7 @@ var modelCapabilities = map[string]Capabilities{
 	// which produced thinking{type:"enabled"} and a 400 on the real API.
 	"claude-fable-5":   {Vision: true, Reasoning: true, Search: true, Tools: true, ThinkingFormat: "claude-adaptive"},
 	"claude-fable-5-1": {Vision: true, Reasoning: true, Search: true, Tools: true, ThinkingFormat: "claude-adaptive", ThinkingCanDisable: new(false), ContextWindow: 1000000, MaxOutput: 128000},
+	"claude-fable-5-2": {Vision: true, PDF: true, Reasoning: true, Search: true, Tools: true, ThinkingFormat: "claude-adaptive", ThinkingCanDisable: new(false), ContextWindow: 1000000, MaxOutput: 128000},
 	"glm-5.2":          {Reasoning: true, Tools: true, ThinkingFormat: "zai", ThinkingEffortSupported: true, ThinkingCanDisable: new(false)},
 	// Upstream b6a9ca43: the exact glm-5.2 entry shadows the *glm-5.2*
 	// pattern completely, so it must repeat the pattern's
@@ -918,6 +919,7 @@ var patternCapabilities = []patternCapability{
 	{pattern: "*llama*", caps: Capabilities{Tools: true}},
 
 	{pattern: "*codestral*", caps: Capabilities{Tools: true}},
+	{pattern: "*devstral*", caps: Capabilities{Vision: true, Tools: true}},
 	{pattern: "*mistral-large*", caps: Capabilities{Vision: true, Tools: true}},
 	{pattern: "*mistral*", caps: Capabilities{Tools: true}},
 
@@ -1092,6 +1094,19 @@ func GetCapabilitiesForModel(provider, model string) Capabilities {
 	// per-family patterns below (deepseek-v4 → vision:false, thinkingFormat
 	// deepseek, …) must not win here. Upstream short-circuits the same way
 	// (open-sse/providers/capabilities.js:570).
+	// The goat entry is the documented Provider API: three lanes, per-model
+	// windows from the live feed, and a thinking shape that follows the lane the
+	// model is declared on. It must not inherit the /alpha/generate block below,
+	// whose single-lane assumptions (1M window for everything, the CLI thinking
+	// writer) are exactly what this provider exists to correct.
+	if isCommandCodeGoatProvider(provider) {
+		res := commandCodeGoatCapabilities(model)
+		capsCacheMu.Lock()
+		capsCache[key] = res
+		capsCacheMu.Unlock()
+		return res
+	}
+
 	if isCommandCodeProvider(provider) {
 		res := commandCodeCapabilities(model)
 		capsCacheMu.Lock()
