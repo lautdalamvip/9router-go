@@ -10,28 +10,28 @@ import (
 	"strings"
 	"time"
 
-	"github.com/spf13/viper"
 	"9router/proxy/internal/constants"
 	"9router/proxy/internal/log"
+	"github.com/spf13/viper"
 )
 
 // Config holds the proxy gateway configuration.
 type Config struct {
-	Host                string
-	Port                int
-	DatabasePath        string
-	JWTSecret           string
-	InitialPassword     string
-	APIKeySecret        string
-	MachineIDSalt       string
-	RTKEnabled          bool
-	CavemanEnabled      bool
-	PonytailEnabled     bool
-	ADHDEnabled         bool
-	SeatAttemptBudgetMs int
-	ProxyRefreshEnabled bool
+	Host                 string
+	Port                 int
+	DatabasePath         string
+	JWTSecret            string
+	InitialPassword      string
+	APIKeySecret         string
+	MachineIDSalt        string
+	RTKEnabled           bool
+	CavemanEnabled       bool
+	PonytailEnabled      bool
+	ADHDEnabled          bool
+	SeatAttemptBudgetMs  int
+	ProxyRefreshEnabled  bool
 	ProxyRefreshInterval time.Duration
-	ProxyRefreshTopN    int
+	ProxyRefreshTopN     int
 }
 
 // NewViper creates and configures a new Viper instance reading from .env with standard defaults.
@@ -210,21 +210,21 @@ func LoadConfigFromViper(v *viper.Viper) *Config {
 		proxyRefreshTopN = 15
 	}
 	return &Config{
-		Host:                host,
-		Port:                port,
-		DatabasePath:        dbPath,
-		JWTSecret:           loadJWTSecret(v, dataDir),
-		InitialPassword:     initialPassword,
-		APIKeySecret:        apiKeySecret,
-		MachineIDSalt:       machineIDSalt,
-		RTKEnabled:          rtkEnabled,
-		CavemanEnabled:      cavemanEnabled,
-		PonytailEnabled:     ponytailEnabled,
-		ADHDEnabled:         adhdEnabled,
-		SeatAttemptBudgetMs: seatAttemptBudgetMs,
-		ProxyRefreshEnabled: proxyRefreshEnabled,
+		Host:                 host,
+		Port:                 port,
+		DatabasePath:         dbPath,
+		JWTSecret:            loadJWTSecret(v, dataDir),
+		InitialPassword:      initialPassword,
+		APIKeySecret:         apiKeySecret,
+		MachineIDSalt:        machineIDSalt,
+		RTKEnabled:           rtkEnabled,
+		CavemanEnabled:       cavemanEnabled,
+		PonytailEnabled:      ponytailEnabled,
+		ADHDEnabled:          adhdEnabled,
+		SeatAttemptBudgetMs:  seatAttemptBudgetMs,
+		ProxyRefreshEnabled:  proxyRefreshEnabled,
 		ProxyRefreshInterval: proxyRefreshInterval,
-		ProxyRefreshTopN:    proxyRefreshTopN,
+		ProxyRefreshTopN:     proxyRefreshTopN,
 	}
 }
 
