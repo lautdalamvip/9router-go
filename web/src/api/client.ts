@@ -2499,6 +2499,11 @@ export const api = {
       `/api/proxy-pools/${encodeURIComponent(id)}/test`,
       { method: 'POST' }
     ),
+  refreshStormsiaProxies: () =>
+    request<{ success: boolean; poolId?: string; poolName?: string; totalFetched?: number; aliveCount?: number; message?: string; error?: string }>(
+      '/api/proxy-pools/stormsia/refresh',
+      { method: 'POST' }
+    ),
   deployVercelRelay: (payload: { vercelToken: string; projectName?: string }) =>
     request<{ success?: boolean; proxyUrl?: string; deployUrl?: string; error?: string }>('/api/proxy-pools/vercel-deploy', {
       method: 'POST',

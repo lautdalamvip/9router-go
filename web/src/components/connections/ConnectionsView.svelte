@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { api, type ProviderConnection, type ProviderNode, type ProviderNodeLimitsPatch, type Settings } from '../../api/client'
+  import { api, type ProviderConnection, type ProviderNode, type ProviderNodeLimitsPatch } from '../../api/client'
   import { hasAnyNodeLimitPatch } from '../../lib/node-limits'
   import ProvidersOverviewGrid from './ProvidersOverviewGrid.svelte'
   import ProviderDetailView from './ProviderDetailView.svelte'
@@ -8,8 +8,6 @@
   interface Props {
     connections?: ProviderConnection[]
     providerNodes?: ProviderNode[]
-    /** App settings; forwarded to the overview grid for provider-level proxy detection. */
-    settings?: Settings | null
     onRefresh: () => void
     selectedProviderId?: string | null
     onSelectProvider?: (id: string) => void
@@ -21,7 +19,6 @@
   let {
     connections = [],
     providerNodes = [],
-    settings = null,
     onRefresh,
     onImport = () => {},
     selectedProviderId = $bindable(null),
@@ -101,7 +98,6 @@
   <ProvidersOverviewGrid
     {connections}
     {providerNodes}
-    {settings}
     onSelectProvider={(id) => {
       selectedProviderId = id
       onSelectProvider?.(id)
